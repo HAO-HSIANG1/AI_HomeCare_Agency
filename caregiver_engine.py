@@ -10,7 +10,7 @@ CLI (ai_caregiver_pipeline.py) 與網頁儀錶板 (app.py) 共用同一份邏輯
 欄位時才生效，因此仍可原封不動套用在既有的單日排班資料表格式上。
 """
 
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 import os
 import re
 from dataclasses import dataclass, field
@@ -2088,6 +2088,47 @@ def _iso_day(value):
     return None if pd.isna(parsed) else parsed.strftime('%Y-%m-%d')
 
 
+_LEDGER_MEMO = {}
+
+
+def _month_totals_memo(cg_id, day, other_tasks, other_assignments, caregivers, config):
+    """某位居服員『當月其他日期』每天的工時（服務＋轉場）。同一批資料重複查詢時直接沿用，不再重算路線。
+
+    key 含任務時間、地點、居服員起點與交通設定，資料有任何變動就會算出新的 key。"""
+    key = None
+    try:
+        person = caregivers.loc[caregivers['居服員ID'].astype(str).eq(str(cg_id))]
+        home = tuple(str(person.iloc[0].get(c)) for c in ('服務起點_緯度(家)', '服務起點_經度(家)', '常用交通工具')) if len(person) else ()
+        cols = [c for c in ('任務ID', '日期', '時間窗_開始', '時間窗_結束', '案家ID', '服務地點_緯度', '服務地點_經度') if c in other_tasks]
+        rows = tuple(map(tuple, other_tasks[cols].astype(str).to_numpy()))
+        who = tuple(sorted(other_assignments['任務ID'].astype(str)))
+        key = (str(cg_id), day.strftime('%Y-%m-%d'), home, rows, who, float(config.buffer_mins), float(config.travel_min_per_km))
+        hit = _LEDGER_MEMO.get(key)
+        if hit is not None:
+            return dict(hit)
+    except Exception:
+        key = None
+    routes = calculate_schedule_travel(other_assignments, other_tasks, caregivers, config)
+    lookup = other_tasks.set_index('任務ID').to_dict('index')
+    totals = {}
+    for date, group in routes.groupby('交通日期'):
+        total = 0.0
+        for _, route in group.iterrows():
+            task = lookup[route['任務ID']]
+            start, end = parse_time(f"{task['時間窗_開始']}-{task['時間窗_結束']}")
+            if start is None or end is None:
+                total = float('nan'); break
+            total += (end - start).total_seconds() / 60
+            if _text(route.get('前一任務ID')) and _text(route.get('起點案號')) != _text(task.get('案家ID')):
+                total += _number(route.get('含緩衝交通時間(分)'))
+        totals[(str(cg_id), str(date))] = total
+    if key is not None:
+        if len(_LEDGER_MEMO) > 4000:
+            _LEDGER_MEMO.clear()
+        _LEDGER_MEMO[key] = dict(totals)
+    return totals
+
+
 def _effective_month_ledger(task_id, cg_id, day, tasks, assignments, caregivers, config, dates=None):
     """Manual moves recalculate released work instead of retaining the old day.
 
@@ -2123,19 +2164,8 @@ def _effective_month_ledger(task_id, cg_id, day, tasks, assignments, caregivers,
     other_assignments=assignments.loc[assignments['派單居服員'].astype(str).eq(str(cg_id)) & assignments['任務ID'].isin(other_tasks['任務ID'])].copy()
     if other_assignments.empty:
         return ledger
-    routes=calculate_schedule_travel(other_assignments,other_tasks,caregivers,config)
-    lookup=other_tasks.set_index('任務ID').to_dict('index')
-    for date,group in routes.groupby('交通日期'):
-        total=0.0
-        for _,route in group.iterrows():
-            task=lookup[route['任務ID']]
-            start,end=parse_time(f"{task['時間窗_開始']}-{task['時間窗_結束']}")
-            if start is None or end is None:
-                total=float('nan');break
-            total+=(end-start).total_seconds()/60
-            if _text(route.get('前一任務ID')) and _text(route.get('起點案號'))!=_text(task.get('案家ID')):
-                total+=_number(route.get('含緩衝交通時間(分)'))
-        ledger[(str(cg_id),str(date))]=total
+    totals=_month_totals_memo(cg_id,day,other_tasks,other_assignments,caregivers,config)
+    ledger.update(totals)
     return ledger
 
 

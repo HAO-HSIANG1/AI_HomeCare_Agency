@@ -1,5 +1,5 @@
 """One pending row per client and a read-only whole-client assignment preview."""
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 from dataclasses import replace
 import hashlib
 from datetime import datetime
@@ -385,9 +385,14 @@ def preview_client_assignment(tasks, assignments, caregivers, clients, config, c
         else:
             failed.append({'任務ID':task['任務ID'],'日期':task['日期'],'原因':'請假代班缺人；'+'；'.join(reasons)})
 
-    def evaluate_row(row,candidate,extra_assigned=()):
+    def evaluate_row(row,candidate,extra_assigned=(),live_transit=False):
         """以目前（預覽結束時）的班表，檢查「某一筆（可以是改過時間／日期、或全新的拆段）服務」能不能由某人接。
         提供給處理建議使用；不會更動預覽結果。"""
+        # 分析階段不替「搭大眾運輸」的居服員逐一查 Google（每個假設時段都是一次付費查詢、每次 1～2 秒）；
+        # 他們仍可在「我想自己調整」或整案預覽時被指定，那時才會真的查。
+        if not live_transit and str(people.get(str(candidate), {}).get('常用交通工具') or '機車').strip() == '大眾運輸':
+            return {'cg_id': candidate, 'available': False, 'reason': 'transit_skipped',
+                    'detail': '搭大眾運輸的居服員不在自動建議內（需逐時段查 Google）；要指定請用「我想自己調整」'}
         row = dict(row)
         date = str(row['日期'])[:10]
         row['日期'] = date
@@ -401,10 +406,21 @@ def preview_client_assignment(tasks, assignments, caregivers, clients, config, c
         saved = trial.client_backup_map
         if candidate!=worker and candidate not in team:
             trial.client_backup_map = {**saved,client:tuple(team[1:])+(candidate,)}
+        # 當天其他任務的查詢表沿用預覽時已建好的，只補上這一筆（省掉每次把整天資料轉成字典）。
+        registered = None
+        base_entry = trial.dispatch_cache['days'].get(id(days.get(date))) if date in days else None
+        if base_entry is not None:
+            one = pd.DataFrame([row]).reindex(columns=proposed.columns).set_index('任務ID').to_dict('index')
+            lookup = {k: v for k, v in base_entry['lookup'].items() if k != row['任務ID']}
+            lookup.update(one)
+            registered = id(frame)
+            trial.dispatch_cache['days'][registered] = {'frame': frame, 'ids': set(frame['任務ID']), 'lookup': lookup}
         try:
             return engine._evaluate_reassignment(row['任務ID'],candidate,frame,day_assigned,caregivers,trial)
         finally:
             trial.client_backup_map = saved
+            if registered is not None:
+                trial.dispatch_cache['days'].pop(registered, None)
     return {'tasks':proposed,'accepted':pd.DataFrame(accepted,columns=['任務ID','派單居服員']),
             'failed':pd.DataFrame(failed,columns=['任務ID','日期','原因']),
             'client':client,'worker':worker,'team':tuple(team[1:]),'total':len(selected),'primary_map':trial.client_primary_map,

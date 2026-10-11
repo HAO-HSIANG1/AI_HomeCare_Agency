@@ -1,6 +1,6 @@
 """Shared service-hour and rest checks; durations come from occupied time slots."""
 
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 def workload_error(slots, cap_hours=8, occupied_minutes=0, continuous_limit=240, rest_minutes=30, transfers=None):
     slots=sorted(slots)
     durations=[(b-a).total_seconds()/60 for a,b in slots]
@@ -68,7 +68,7 @@ def incremental_travel(result, tasks, caregivers, config, cache, calculate, init
     task_hash={}
     for tid,h in zip(tasks['任務ID'].tolist(),_row_hashes(tasks)):
         task_hash.setdefault(tid,[]).append(h)
-    cfg_text=repr({k:v for k,v in vars(config).items() if k not in ('work_day_minutes','primary_profiles','client_primary_map','hourly_wage','transition_wage','sa10_hourly_price')})
+    cfg_text=repr({k:v for k,v in vars(config).items() if k not in ('work_day_minutes','primary_profiles','client_primary_map','client_backup_map','dispatch_cache','hourly_wage','transition_wage','sa10_hourly_price','max_monthly_overtime_hours')})
     cg_hash={}
     def caregiver_hash(worker):
         if worker not in cg_hash:

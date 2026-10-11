@@ -12,7 +12,7 @@
     python repair_workbook.py 居服機構資料.xlsx --start 2026-10-01 --end 2026-10-31
 會輸出 <原檔名>_修復後.xlsx 與 <原檔名>_異動明細.csv。
 """
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 import argparse
 import os
 import re

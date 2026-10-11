@@ -1,5 +1,5 @@
 """Presentation-only helpers. No scheduling or external requests."""
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 import streamlit as st
 
 CSS = """

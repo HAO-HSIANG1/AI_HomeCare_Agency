@@ -2,7 +2,7 @@
 
 No Streamlit here. The Streamlit page only collects the case, calls these functions and renders.
 """
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 
 from datetime import datetime
 

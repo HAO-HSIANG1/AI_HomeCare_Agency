@@ -1,5 +1,5 @@
 """v15 tests: transit fallback, unified worker status table, multi-worker team suggestion, de-identified worker column."""
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 import unittest
 from unittest.mock import patch
 import pandas as pd

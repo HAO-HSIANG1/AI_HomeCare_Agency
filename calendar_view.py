@@ -1,5 +1,5 @@
 """CareFlow 班表工作台：單日全員、個人整週與異動清單。"""
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 from datetime import date, datetime, timedelta
 import re
 import pandas as pd

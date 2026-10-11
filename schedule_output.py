@@ -1,5 +1,5 @@
 """Pure operational schedule/route views. Rendering and export never call map APIs."""
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 from io import BytesIO
 import hashlib
 import json

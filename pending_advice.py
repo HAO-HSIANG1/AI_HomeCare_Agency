@@ -4,7 +4,7 @@
 最前面的幾項還會整案重跑一次預覽，顯示「套用後整案還剩幾次排不進」。
 建議只是參考，居督按「套用」之後仍要再預覽、確認。
 """
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 import copy
 import pandas as pd
 from pending_clients import _fmt, _hm, split_points, default_split_minutes, split_task, pending_week_label
@@ -340,7 +340,7 @@ def _plan_notes(steps):
     return notes
 
 
-def build_plans(base, caregivers, config, run_edits, edits, unit_minutes=None, max_plans=3, budget_seconds=45.0):
+def build_plans(base, caregivers, config, run_edits, edits, unit_minutes=None, max_plans=3, budget_seconds=45.0, memo=None):
     """從目前狀態出發，一步一步「試、驗證、套用」，產生能把整案排進去（或盡量排進去）的方案。
 
     run_edits(edits_obj) → 整案預覽。每個方案用不同的偏好順序（先挪時間／先換人／先拆段），
@@ -351,6 +351,15 @@ def build_plans(base, caregivers, config, run_edits, edits, unit_minutes=None, m
         return []
     deadline = time.time() + budget_seconds
     plans, seen = [], set()
+    # memo：同一案、同一份班表底下，相同的調整只算一次（三種偏好順序、卡片與完整方案共用）。
+    memo = memo if memo is not None else {}
+    advice_memo, preview_memo = memo.setdefault('advice', {}), memo.setdefault('preview', {})
+
+    def cached_run(trial_edits):
+        key = repr(trial_edits)
+        if key not in preview_memo:
+            preview_memo[key] = run_edits(trial_edits)
+        return preview_memo[key]
     for order in _ORDERS:
         if len(plans) >= max_plans or time.time() > deadline:
             break
@@ -358,7 +367,10 @@ def build_plans(base, caregivers, config, run_edits, edits, unit_minutes=None, m
         for _ in range(4):
             if preview['failed'].empty or time.time() > deadline:
                 break
-            cands = [c for c in advise(preview, caregivers, config, None, unit_minutes, max_groups=1, per_kind=2) if c.get('apply')]
+            _akey = repr(cur_edits)
+            if _akey not in advice_memo:
+                advice_memo[_akey] = [c for c in advise(preview, caregivers, config, None, unit_minutes, max_groups=1, per_kind=2) if c.get('apply')]
+            cands = list(advice_memo[_akey])
             if any(c['必要'] for c in cands):
                 cands = [c for c in cands if c['必要']]
             before, pick = len(preview['failed']), None
@@ -367,7 +379,7 @@ def build_plans(base, caregivers, config, run_edits, edits, unit_minutes=None, m
                 for cand in [c for c in cands if c['種類'] == kind][:3]:
                     try:
                         trial_edits = apply_suggestion(cur_edits, cand['apply'])
-                        after = run_edits(trial_edits)
+                        after = cached_run(trial_edits)
                     except Exception:
                         continue
                     n = len(after['failed'])

@@ -3,7 +3,7 @@
 Every visit uses the central constraints. Only actual leave permits a backup.
 This constructs a feasible draft, not a proven global optimum.
 """
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 from dataclasses import replace
 from collections import Counter
 import re

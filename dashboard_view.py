@@ -1,5 +1,5 @@
 """派單儀錶板畫面（Streamlit 原生元件，不產生圖片，每次重跑幾乎不花時間）。"""
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 import pandas as pd
 import streamlit as st
 
@@ -26,9 +26,13 @@ def render_dashboard(D, caregiver_label=str, client_label=str):
     c5.metric('轉場佔總工時', '—' if pd.isna(s['travel_share']) else f"{s['travel_share'] * 100:.1f}%",
               help='轉場工時 ÷ 總工時。越低代表路線越順。')
 
-    tab_gap, tab_load, tab_travel, tab_stable = st.tabs(['哪裡派不出去', '人力負荷', '交通', '固定人選穩定度'])
+    tab_gap, tab_load, tab_travel, tab_stable = st.tabs(['什麼時候缺人', '人力負荷', '交通', '固定人選穩定度'])
 
     with tab_gap:
+        _render_demand_heat(st, D)
+        if s['unassigned']:
+            st.markdown('---')
+            st.markdown('**哪裡派不出去**')
         if s['unassigned'] == 0:
             st.success('所有服務都已派出。')
         else:
@@ -47,18 +51,6 @@ def render_dashboard(D, caregiver_label=str, client_label=str):
                 st.bar_chart(by_day[['未派']].rename(columns={'未派': '未派筆數'}), height=220)
                 worst = by_day.sort_values(['成功率', '任務數'], ascending=[True, False]).head(3)
                 st.caption('成功率最低的日子：' + '、'.join(f"{d}（週{r['星期']}）{r['成功率']:.0f}%" for d, r in worst.iterrows()))
-        heat = D['heat_unassigned']
-        if not heat.empty and s['unassigned']:
-            st.markdown('**星期 × 開始時段：未派筆數**（顏色越深越缺人）')
-            try:
-                st.dataframe(heat.style.background_gradient(cmap='Reds', axis=None).format('{:d}'), width='stretch')
-            except Exception:
-                st.dataframe(heat, width='stretch')
-            rate = D['heat_rate']
-            weak = rate.stack().dropna().sort_values().head(3)
-            if len(weak):
-                st.caption('成功率最低的時段：' + '、'.join(f'{day} {hour} 約 {v:.0f}%' for (day, hour), v in weak.items())
-                           + '。這些時段可考慮安排機動人力或把固定班移開。')
 
     with tab_load:
         wl = D['workload']
@@ -107,3 +99,46 @@ def render_dashboard(D, caregiver_label=str, client_label=str):
                 view[col] = view[col].map(caregiver_label)
             view['案家ID'] = view['案家ID'].map(client_label)
             st.dataframe(view, hide_index=True, width='stretch')
+
+
+def _render_demand_heat(st, D):
+    """排班需求熱圖：什麼星期、哪個時段最需要人（紅＝需求高／吃緊，就多排幾位）。"""
+    demand = D.get('heat_demand')
+    if demand is None or demand.empty:
+        st.info('排班資料沒有日期與時段，無法畫需求熱圖。')
+        return
+    supply, pressure = D.get('heat_supply'), D.get('heat_pressure')
+    has_supply = supply is not None and not supply.empty
+    modes = ['需求量（平均同時要幾位居服員）', '整段期間總服務人時']
+    if has_supply:
+        modes.append('吃緊度（需求 ÷ 可上班人數）')
+    modes.append('未派人時（缺人的地方）')
+    st.markdown('**星期 × 時段：排班需求量熱圖**（顏色越紅＝這個時段越需要人，越該多排班）')
+    mode = st.radio('熱圖看什麼', modes, horizontal=True, key='dash_heat_mode', label_visibility='collapsed')
+    if mode.startswith('需求量'):
+        table, fmt, unit = demand, '{:.1f}', '位'
+    elif mode.startswith('整段'):
+        table, fmt, unit = D['heat_hours'], '{:.1f}', '人時'
+    elif mode.startswith('吃緊度'):
+        table, fmt, unit = pressure, '{:.0%}', ''
+    else:
+        table, fmt, unit = D['heat_unassigned_hours'], '{:.1f}', '人時'
+    try:
+        st.dataframe(table.style.background_gradient(cmap='Reds', axis=None).format(fmt), width='stretch')
+    except Exception:
+        st.dataframe(table, width='stretch')
+    from dashboard_metrics import peak_slots
+    peaks = peak_slots(table, supply if has_supply else None, demand)
+    if peaks:
+        def one(p):
+            text = f"{p['星期']} {p['時段']}"
+            if mode.startswith('吃緊度'):
+                text += f"（需求 {p['需求']:.1f} 位 ÷ 可上班 {p['可上班']} 位＝{p['值']:.0%}）"
+            elif mode.startswith('未派'):
+                text += f"（未派 {p['值']:.1f} 人時）"
+            else:
+                text += f"（{p['值']:.1f}{unit}" + (f"，可上班 {p['可上班']} 位" if p['可上班'] is not None else '') + '）'
+            return text
+        st.caption('最紅的時段：' + '、'.join(one(p) for p in peaks)
+                   + '。這些時段建議多排幾位上班（或安排備援待命）；顏色淺的時段人力較寬鬆，可以把可挪動的服務移過去。')
+    st.caption('需求含已派與未派的全部服務；服務跨小時會按重疊分鐘拆開。「可上班」依居服員休息日與每日可服務時段計算，不含個別請假。')

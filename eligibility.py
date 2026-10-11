@@ -6,7 +6,7 @@ so the table can never say "OK" for something the dispatcher would reject.
 Stage 2 (on demand): run the full whole-client preview (conflicts with other clients, rest, hours, travel,
 monthly overtime) for the best few candidates.
 """
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 
 from collections import Counter, OrderedDict
 from dataclasses import replace

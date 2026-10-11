@@ -8,7 +8,7 @@
   5. 交通是不是吃掉太多工時？（轉場時間分布、轉場佔總工時比）
   6. 哪些案家老是換人？（非固定人選服務最多的案家，作為調整歷史首選的依據）
 """
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 import pandas as pd
 
 WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日']
@@ -23,8 +23,93 @@ def _flag(value):
     return value is True or str(value).strip().lower() in ('true', '1', '是')
 
 
+def _clock_minutes(value):
+    text = _text(value)[:5]
+    try:
+        hour, minute = text.split(':')
+        return int(hour) * 60 + int(minute)
+    except ValueError:
+        return None
+
+
+def demand_heat(t, caregivers=None):
+    """星期 × 小時的『排班需求量』。需求含已派與未派，服務跨小時就按重疊分鐘拆開。
+
+    demand  ：平均同時需要幾位居服員（＝該時段每週平均服務人時）。
+    hours   ：整段排班期間該時段的總服務人時。
+    supply  ：該星期、該時段『可上班』的居服員人數（依休息日與每日可服務時段）。
+    pressure：demand ÷ supply，越高代表人力越吃緊。
+    """
+    empty = {'demand': pd.DataFrame(), 'hours': pd.DataFrame(), 'supply': pd.DataFrame(), 'pressure': pd.DataFrame(),
+             'unassigned_hours': pd.DataFrame()}
+    needed = {'_date', '時間窗_開始', '時間窗_結束'}
+    if t is None or t.empty or not needed.issubset(t.columns):
+        return empty
+    dated = t.dropna(subset=['_date'])
+    if dated.empty:
+        return empty
+    minutes, missing = {}, {}
+    for date, start, end, ok in zip(dated['_date'], dated['時間窗_開始'], dated['時間窗_結束'], dated['_assigned']):
+        a, b = _clock_minutes(start), _clock_minutes(end)
+        if a is None or b is None or b <= a:
+            continue
+        weekday = date.weekday()
+        for hour in range(a // 60, (b - 1) // 60 + 1):
+            overlap = min(b, (hour + 1) * 60) - max(a, hour * 60)
+            if overlap > 0:
+                minutes[(weekday, hour)] = minutes.get((weekday, hour), 0) + overlap
+                if not ok:
+                    missing[(weekday, hour)] = missing.get((weekday, hour), 0) + overlap
+    if not minutes:
+        return empty
+    first, last = dated['_date'].min(), dated['_date'].max()
+    span = pd.date_range(first, last, freq='D')
+    occurrences = {wd: max(1, int(sum(1 for d in span if d.weekday() == wd))) for wd in range(7)}
+    hours_range = list(range(min(h for _, h in minutes), max(h for _, h in minutes) + 1))
+    weekdays = sorted({wd for wd, _ in minutes})
+    names = {wd: '週' + WEEKDAYS[wd] for wd in weekdays}
+    cols = [f'{h:02d}時' for h in hours_range]
+
+    def table(fn):
+        return pd.DataFrame([[fn(wd, h) for h in hours_range] for wd in weekdays],
+                            index=[names[w] for w in weekdays], columns=cols, dtype=float)
+    hours = table(lambda wd, h: minutes.get((wd, h), 0) / 60)
+    unassigned = table(lambda wd, h: missing.get((wd, h), 0) / 60)
+    demand = table(lambda wd, h: minutes.get((wd, h), 0) / 60 / occurrences[wd])
+    supply = pd.DataFrame()
+    if caregivers is not None and not caregivers.empty and '可排班星期' in caregivers:
+        people = []
+        for _, row in caregivers.iterrows():
+            days = {int(x) for x in _text(row.get('可排班星期')).replace('，', ',').split(',') if x.strip().isdigit()}
+            a = _clock_minutes(row.get('每日可服務時段_起'))
+            b = _clock_minutes(row.get('每日可服務時段_迄'))
+            people.append((days, 0 if a is None else a, 24 * 60 if b is None else b))
+        if people:
+            def count(wd, h):
+                return sum(1 for days, a, b in people if (not days or (wd + 1) in days) and a <= h * 60 and (h + 1) * 60 <= b)
+            supply = table(count)
+    pressure = pd.DataFrame()
+    if not supply.empty:
+        pressure = (demand / supply.where(supply > 0)).fillna(0.0)
+    return {'demand': demand, 'hours': hours, 'supply': supply, 'pressure': pressure, 'unassigned_hours': unassigned}
+
+
+def peak_slots(heat, supply=None, demand=None, n=3):
+    """熱圖中數值最高的 n 個格子，供畫面寫成一句話。"""
+    if heat is None or heat.empty:
+        return []
+    stacked = heat.stack()
+    stacked = stacked[stacked > 0].sort_values(ascending=False, kind='stable').head(n)
+    out = []
+    for (day, hour), value in stacked.items():
+        out.append({'星期': day, '時段': hour, '值': float(value),
+                    '需求': None if demand is None or demand.empty else float(demand.loc[day, hour]),
+                    '可上班': None if supply is None or supply.empty else int(supply.loc[day, hour])})
+    return out
+
+
 def build_dashboard(tasks, assignments, diagnostics=None, task_payroll=None, daily_payroll=None,
-                    monthly_payroll=None, routes=None, primary_map=None, load_warning=0.8):
+                    monthly_payroll=None, routes=None, primary_map=None, load_warning=0.8, caregivers=None):
     """回傳 dict：summary / by_day / heat_unassigned / heat_rate / reasons / workload / travel_bins / travel_stats / nonprimary。"""
     primary_map = {str(k): _text(v) for k, v in (primary_map or {}).items()}
     t = tasks.drop_duplicates('任務ID').copy()
@@ -177,6 +262,9 @@ def build_dashboard(tasks, assignments, diagnostics=None, task_payroll=None, dai
         'avg_day_hours': avg_day, 'near_limit_people': near_limit, 'people': int(len(workload)),
         'travel_share': travel_share,
     }
+    heat = demand_heat(t, caregivers)
     return {'summary': summary, 'by_day': by_day, 'heat_unassigned': heat_unassigned, 'heat_rate': heat_rate,
+            'heat_demand': heat['demand'], 'heat_hours': heat['hours'], 'heat_supply': heat['supply'],
+            'heat_pressure': heat['pressure'], 'heat_unassigned_hours': heat['unassigned_hours'],
             'reasons': reasons, 'workload': workload, 'travel_bins': travel_bins, 'travel_stats': travel_stats,
             'nonprimary': nonprimary}

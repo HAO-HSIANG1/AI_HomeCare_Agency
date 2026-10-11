@@ -3,7 +3,7 @@
 Payroll is a planning estimate for ordinary working days, not a payroll settlement.
 Home commuting is excluded. Inter-client travel and the working buffer count as work.
 """
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 import json
 import math
 

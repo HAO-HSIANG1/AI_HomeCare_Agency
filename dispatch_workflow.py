@@ -1,5 +1,5 @@
 """Unified local dispatch follow-up and availability. No external messages are sent."""
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 import hashlib
 import json
 import sqlite3

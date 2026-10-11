@@ -3,7 +3,7 @@
 用在「Excel 最小改動修復」：改員工休息日、請假、週服務計畫的星期／起迄時間，或把過長的連續服務拆成兩段。
 公式欄（服務時數、服務分鐘、請假時數）保留公式並同步更新快取值，讓只讀快取值的匯入程式與 Excel 都看到一致的數字。
 """
-CAREFLOW_BUILD = '2026.10.11-v17'
+CAREFLOW_BUILD = '2026.10.11-v18'
 from io import BytesIO
 import posixpath
 from xml.dom import minidom

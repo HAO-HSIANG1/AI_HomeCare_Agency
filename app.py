@@ -1396,58 +1396,132 @@ if "last_result" in st.session_state:
               help="依每位員工每天服務順序：服務起點→首案，前案→下一案。不含轉場緩衝及末案返家。")
     st.caption(f"統計範圍：{_scope_label}　·　平均適配得分 {avg_score:.1f} 分")
     if True:
-        @st.fragment
+        _unit_minutes = unit_minutes_from_master(st.session_state.get('edit_service_code'))
+        _limit_mins = float(getattr(config, 'continuous_work_limit_mins', 240.0))
+
+        def _label_ids(text):
+            """把文字裡的居服員編號換成顯示用名稱（遵守遮罩設定）。"""
+            out = str(text)
+            if _show_names:
+                for _cid in sorted(_caregiver_names, key=len, reverse=True):
+                    out = re.sub(r'(?<![A-Za-z0-9])' + re.escape(str(_cid)) + r'(?![A-Za-z0-9])', caregiver_label(_cid), out)
+            return out
+
+        _sig_memo = []
+
+        def _base_signature():
+            if _sig_memo:
+                return _sig_memo[0]
+            _sig_memo.append(hashlib.sha256(repr((
+                _frame_digest(_operational_assignments[['任務ID', '派單居服員']]),
+                _frame_digest(df_tasks[[c for c in ['任務ID', '案家ID', '日期', '時間窗_開始', '時間窗_結束'] if c in df_tasks]]),
+                sorted((str(k), str(v)) for k, v in config.client_primary_map.items()),
+                sorted((str(k), tuple(map(str, v))) for k, v in (getattr(config, 'client_backup_map', None) or {}).items()),
+                _frame_digest(res['df_cg']), config.max_monthly_overtime_hours)).encode()).hexdigest())
+            return _sig_memo[0]
+
+        import uuid as _uuid
+        import dataclasses as _dc
+        import analysis_bg
+        _bg_session = res.setdefault('_bg_id', _uuid.uuid4().hex)
+        _empty_key = repr(empty_edits())
+        _bg_ctx = []
+
+        def _bg_context():
+            """背景分析用的資料快照（算的是「現在這一刻」的班表，之後班表變了就會被丟掉）。"""
+            if not _bg_ctx:
+                _cfg = _dc.replace(config, client_primary_map=dict(config.client_primary_map),
+                                   client_backup_map=dict(getattr(config, 'client_backup_map', None) or {}),
+                                   work_day_minutes=dict(config.work_day_minutes), dispatch_cache={},
+                                   primary_profiles=dict(getattr(config, 'primary_profiles', None) or {}))
+                _bg_ctx.append({'tasks': df_tasks.copy(), 'assignments': _operational_assignments.copy(), 'caregivers': res['df_cg'].copy(),
+                                'clients': res['df_cl'].copy(), 'config': _cfg, 'unit_minutes': _unit_minutes, 'limit': _limit_mins})
+            return _bg_ctx[0]
+
+        def _bg_key(case, worker, stage):
+            return (_bg_session, _base_signature(), str(case), str(worker), stage)
+
+        def _bg_submit(items):
+            """把未派案家的分析排進背景：先全部算「最優先方案」（卡片用），再補齊其他方案。已排過的不重複。"""
+            _sig = _base_signature()
+            analysis_bg.forget_other_signatures(_bg_session, _sig)
+            _items = [(str(c), str(w)) for c, w in items if str(c) and str(w) and str(w) != 'None']
+            for _c, _w in _items:
+                _memo = analysis_bg.memo_for(_bg_session, _sig, _c, _w)
+                analysis_bg.submit(_bg_key(_c, _w, 'q'),
+                                   lambda _c=_c, _w=_w, _memo=_memo: analysis_bg.compute_entry(_bg_context(), _c, _w, empty_edits(), True, _memo))
+            for _c, _w in _items:
+                _memo = analysis_bg.memo_for(_bg_session, _sig, _c, _w)
+
+                def _full(_c=_c, _w=_w, _memo=_memo):
+                    _q = analysis_bg.get(_bg_key(_c, _w, 'q'))
+                    _seed = _q['entry'] if _q and _q['state'] == 'done' else None
+                    return analysis_bg.compute_entry(_bg_context(), _c, _w, empty_edits(), False, _memo, existing=_seed)
+                analysis_bg.submit(_bg_key(_c, _w, 'f'), _full)
+
+        def _bg_entry(case, worker):
+            _f, _q = analysis_bg.get(_bg_key(case, worker, 'f')), analysis_bg.get(_bg_key(case, worker, 'q'))
+            for _slot in (_f, _q):
+                if _slot and _slot['state'] == 'done' and _slot['entry'] is not None:
+                    return _slot['entry']
+            return None
+
+        def _bg_state(case, worker):
+            """'done'／'running'（排隊或計算中）／'error'／'none'"""
+            _slots = [analysis_bg.get(_bg_key(case, worker, st_)) for st_ in ('q', 'f')]
+            if any(x and x['state'] == 'error' for x in _slots) and _bg_entry(case, worker) is None:
+                return 'error'
+            if _bg_entry(case, worker) is not None:
+                return 'done'
+            return 'running' if any(x and x['state'] in ('queued', 'running') for x in _slots) else 'none'
+
+        def _analysis(case, edits_obj, worker, quick=False):
+            """整案預覽＋白話診斷＋已驗證的方案。
+            沒有任何手動調整時由背景算好直接取用（還沒算好回傳 None）；有調整時當場算（只算最優先的下一步，約 2～3 秒）。"""
+            _sig = _base_signature()
+            case, worker = str(case), str(worker)
+            if repr(edits_obj) == _empty_key:
+                _bg_submit([(case, worker)])
+                _hit = _bg_entry(case, worker)
+                if _hit is not None or (_bg_state(case, worker) in ('running', 'none') and (case, worker) in _bg_pending):
+                    return _hit
+            store = res.setdefault('_plan_cache', {})
+            if store.get('_sig') != _sig:
+                store.clear()
+                store['_sig'] = _sig
+            key = (case, worker, repr(edits_obj))
+            if key not in store:
+                store[key] = analysis_bg.compute_entry(_bg_context(), case, worker, edits_obj, True,
+                                                       analysis_bg.memo_for(_bg_session, _sig, case, worker))
+            return store[key]
+
+        def _cached_analysis(case, edits_obj, worker):
+            if repr(edits_obj) == _empty_key:
+                return _bg_entry(case, worker)
+            store = res.get('_plan_cache') or {}
+            return store.get((str(case), str(worker), repr(edits_obj))) if store.get('_sig') == _base_signature() else None
+
+        _bg_pending = [(str(r['案家ID']), str(config.client_primary_map.get(str(r['案家ID'])) or ''))
+                       for r in _pending_clients.to_dict('records')[:6]]
+        _bg_pending = [(c, w) for c, w in _bg_pending if w]
+        analysis_bg.forget_other_signatures(_bg_session, _base_signature())
+        # 背景分析等整頁畫完才開始排（不跟畫面搶 CPU）；卡片先顯示「分析中」，之後每 3 秒自動刷新到算完為止。
+        _bg_busy = any(_bg_state(_c, _w) != 'done' and _bg_state(_c, _w) != 'error' for _c, _w in _bg_pending)
+        st.session_state['_pending_timer'] = _bg_busy
+        st.session_state['_pending_tick'] = 0
+
         def _pending_panel():
             """整案處理：先看這個案家需要什麼，再看每位居服員符不符合，最後才選人預覽。只重跑這一區。"""
+            st.session_state['_pending_tick'] = st.session_state.get('_pending_tick', 0) + 1
+            if st.session_state.get('_pending_timer'):
+                if st.session_state['_pending_tick'] >= 2:
+                    _bg_submit(_bg_pending)   # 保險：萬一整頁沒畫到最後，定時刷新時也會開始分析
+                if all(_bg_state(_c, _w) in ('done', 'error') for _c, _w in _bg_pending):
+                    st.session_state['_pending_timer'] = False
+                    st.rerun()
             _has_pending = not _pending_clients.empty
             _panel_title = (f'未派案家 · {len(_pending_clients)} 個案家待整案處理' if _has_pending
                             else '整案調整（進階）· 目前沒有未派案家，仍可重新安排任何案家')
-            _unit_minutes = unit_minutes_from_master(st.session_state.get('edit_service_code'))
-            _limit_mins = float(getattr(config, 'continuous_work_limit_mins', 240.0))
-
-            def _label_ids(text):
-                """把文字裡的居服員編號換成顯示用名稱（遵守遮罩設定）。"""
-                out = str(text)
-                if _show_names:
-                    for _cid in sorted(_caregiver_names, key=len, reverse=True):
-                        out = re.sub(r'(?<![A-Za-z0-9])' + re.escape(str(_cid)) + r'(?![A-Za-z0-9])', caregiver_label(_cid), out)
-                return out
-
-            _sig_memo = []
-
-            def _base_signature():
-                if _sig_memo:
-                    return _sig_memo[0]
-                _sig_memo.append(hashlib.sha256(repr((
-                    _frame_digest(_operational_assignments[['任務ID', '派單居服員']]),
-                    _frame_digest(df_tasks[[c for c in ['任務ID', '案家ID', '日期', '時間窗_開始', '時間窗_結束'] if c in df_tasks]]),
-                    sorted((str(k), str(v)) for k, v in config.client_primary_map.items()),
-                    sorted((str(k), tuple(map(str, v))) for k, v in (getattr(config, 'client_backup_map', None) or {}).items()),
-                    _frame_digest(res['df_cg']), config.max_monthly_overtime_hours)).encode()).hexdigest())
-                return _sig_memo[0]
-
-            def _analysis(case, edits_obj, worker):
-                """整案預覽＋白話診斷＋已驗證的方案；同一個狀態只算一次（換案家、按按鈕都不重算）。"""
-                store = res.setdefault('_plan_cache', {})
-                sig = _base_signature()
-                if store.get('_sig') != sig:
-                    store.clear()
-                    store['_sig'] = sig
-                key = (str(case), str(worker), repr(edits_obj))
-                if key not in store:
-                    def _run(edit_obj):
-                        return preview_with_edits(df_tasks, _operational_assignments, res['df_cg'], res['df_cl'], config, str(case),
-                                                  worker, edit_obj, {}, {}, _unit_minutes)
-                    preview = _run(edits_obj)
-                    store[key] = {'preview': preview, 'diag': diagnose(preview, _unit_minutes, _limit_mins),
-                                  'plans': build_plans(preview, res['df_cg'], config, _run, edits_obj, _unit_minutes, budget_seconds=40.0)
-                                  if not preview['failed'].empty else []}
-                return store[key]
-
-            def _cached_analysis(case, edits_obj, worker):
-                store = res.get('_plan_cache') or {}
-                return store.get((str(case), str(worker), repr(edits_obj))) if store.get('_sig') == _base_signature() else None
-
             def _edit_apply_many(case, applies):
                 """按鈕回呼：把一個方案（一到數個調整）記到這個案家的調整清單。"""
                 store = st.session_state.setdefault('pending_edits', {})
@@ -1487,7 +1561,13 @@ if "last_result" in st.session_state:
                 for _task in _case_rows:
                     _tid = str(_task['任務ID'])
                     overrides[_tid] = {'cg_id': _chosen.get(_tid), 'reason': _failed.get(_tid, _reason)}
-                res['df_tasks'] = _preview['tasks']
+                def _slim(_frame, _ref):
+                    """預覽表已併入案家欄位（多出約 25 欄）；寫回時只留原本的任務欄位，
+                    否則每一列的交通簽章都會改變，整份班表的路線被迫全部重算（存檔後白畫面很久的主因）。"""
+                    _cl_cols = set(res['df_cl'].columns) if res.get('df_cl') is not None else set()
+                    _cols = [c for c in _ref.columns if c in _frame.columns] + [c for c in _frame.columns if c not in _ref.columns and c not in _cl_cols]
+                    return _frame[_cols].copy()
+                res['df_tasks'] = _slim(_preview['tasks'], df_tasks)
                 _weekly_changes = res.setdefault('weekly_plan_changes', {})
                 for _task in _case_rows:
                     if '#' in str(_preview.get('pattern_of', {}).get(str(_task['任務ID']), '')):
@@ -1495,8 +1575,8 @@ if "last_result" in st.session_state:
                     _source_row = pd.to_numeric(_task.get('來源列'), errors='coerce')
                     if pd.notna(_source_row):
                         _weekly_changes[int(_source_row)] = {'開始時間': _task['時間窗_開始'], '結束時間': _task['時間窗_結束']}
-                res['df_tasks_all'] = _preview['tasks'].copy()
-                st.session_state['edit_tasks'] = _preview['tasks'].copy()
+                res['df_tasks_all'] = _slim(_preview['tasks'], res.get('df_tasks_all') if res.get('df_tasks_all') is not None else df_tasks)
+                st.session_state['edit_tasks'] = _slim(_preview['tasks'], st.session_state.get('edit_tasks', df_tasks))
                 for _frame in [st.session_state['edit_cl'], res['df_cl']]:
                     _mask = _frame['案家ID'].astype(str).eq(str(_case))
                     for _field in ['歷史首選', '歷史首選居服員ID']:
@@ -1533,16 +1613,8 @@ if "last_result" in st.session_state:
                     st.caption('系統已替每個案家用同一套規則（資格、時段、交通、休息、連續工作、月工時）逐項試算過。'
                                '點「處理這一案」→ 選一個建議方案 → 確認寫入，就會從這份清單消失。')
                     _rows_pending = _pending_clients.to_dict('records')
-                    _todo = [str(r['案家ID']) for r in _rows_pending[:4]
-                             if str(config.client_primary_map.get(str(r['案家ID'])) or '')
-                             and _cached_analysis(r['案家ID'], empty_edits(), str(config.client_primary_map.get(str(r['案家ID'])))) is None]
-                    if _todo:
-                        with st.spinner(f'第一次開啟：正在分析 {len(_todo)} 個未派案家的原因與解法（約 10～20 秒／案，之後不會重算）…'):
-                            for _c in _todo:
-                                try:
-                                    _analysis(_c, empty_edits(), str(config.client_primary_map.get(_c)))
-                                except Exception:
-                                    pass
+                    if _bg_busy:
+                        st.caption('⏳ 系統正在背景分析（一次一個案家）；算好的會自動換成原因與建議，這段時間你可以先看班表、做別的事。')
                     _chosen_now = str(st.session_state.get('pending_client_choice') or '')
                     for _r in _rows_pending:
                         _cid = str(_r['案家ID'])
@@ -1561,7 +1633,9 @@ if "last_result" in st.session_state:
                                 else:
                                     _c2.markdown('⚠️ 目前找不到單一方案（人力或規則限制），點進去看詳情與補救方向。')
                             else:
-                                _c2.caption(str(_r.get('未派原因') or '待核對') + '　（點「處理這一案」後會算出原因與建議）')
+                                _stt = ('running' if _bg_state(_cid, _own) == 'none' else _bg_state(_cid, _own)) if _own else 'none'
+                                _c2.caption(('⏳ 分析中…　' if _stt == 'running' else '') + str(_r.get('未派原因') or '待核對')
+                                            + ('' if _stt == 'running' else '　（點「處理這一案」後會算出原因與建議）'))
                             _c3.button('處理中 ▸' if _chosen_now == _cid else '處理這一案 →', key=f'pending_card_{_cid}', on_click=_choose_case, args=(_cid,),
                                        disabled=_chosen_now == _cid, type='secondary' if _chosen_now == _cid else 'primary', width='stretch')
                     download_button_quiet('下載未派案家清單 CSV', export_frame(_pending_clients).to_csv(index=False).encode('utf-8-sig'),
@@ -1630,6 +1704,8 @@ if "last_result" in st.session_state:
                             _state = _analysis(_case, _edits, _worker0)
                     except Exception as exc:
                         st.error('分析失敗：' + str(exc)[:160])
+                    if _state is None:
+                        st.info('⏳ 這個案家正在背景分析原因與解法，算好會自動顯示（通常幾秒到十幾秒）；期間可以先看上面的班表。')
                 if _state is not None:
                     _pv = _state['preview']
                     _m1, _m2, _m3 = st.columns(3)
@@ -1924,7 +2000,7 @@ if "last_result" in st.session_state:
                                               '整案調整紀錄.csv', 'text/csv', key='download_whole_client_log')
                         st.caption('原始 Excel 不會被自動改寫；若這些調整要長期保留，請照這份紀錄修改 Excel 後重新匯入。')
 
-        _pending_panel()
+        st.fragment(run_every=3 if _bg_busy else None)(_pending_panel)()
         if not _pending_clients.empty:
             with st.expander(f'查看 {len(_pending_report)} 次未派服務明細',expanded=False):
                 _diag_map = {str(d.get('任務ID')):d for d in _pending_diagnostics}
@@ -2014,7 +2090,7 @@ if "last_result" in st.session_state:
     from dashboard_view import render_dashboard
     try:
         _dashboard = build_dashboard(df_tasks, _effective_for_kpi, _pending_diagnostics, task_payroll, daily_payroll,
-                                     monthly_payroll, df_route_result, config.client_primary_map)
+                                     monthly_payroll, df_route_result, config.client_primary_map, caregivers=res.get('df_cg'))
         render_dashboard(_dashboard, caregiver_label, client_label)
     except Exception as exc:
         st.warning('儀錶板暫時無法產生，其他班表功能不受影響。原因：' + str(exc))
@@ -3727,6 +3803,12 @@ if "last_result" in st.session_state:
         else:
 
             show_table(override_log_df, width="stretch", hide_index=True)
+
+    # 整頁畫完後才啟動背景分析（見上方「未派案家」面板）
+    try:
+        _bg_submit(_bg_pending)
+    except NameError:
+        pass
 
 else:
 

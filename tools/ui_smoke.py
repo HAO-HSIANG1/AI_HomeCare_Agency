@@ -234,6 +234,7 @@ def run_once(st, label):
 
 
 def main():
+    os.environ.setdefault('CAREFLOW_SYNC_ANALYSIS', '1')
     excel = sys.argv[1] if len(sys.argv) > 1 else '/mnt/user-data/outputs/careflow_v13/居服機構資料_三工作表_v2_修復後.xlsx'
     from unittest.mock import patch
     import caregiver_engine as e
@@ -292,12 +293,19 @@ def main():
         oks.append(scenario(f'event {ev}', []))
     # 新流程：卡片 → 方案 → 自動預覽 → 確認寫入（逐案走一遍）；SMOKE_V17=案家1,案家2,...
     n_before = len(st.session_state.get('pending_client_summary', []))
+    def _wait_bg():
+        import analysis_bg, time as _t
+        t0 = _t.time()
+        while any(v['state'] in ('queued', 'running') for v in analysis_bg._REG.values()):
+            _t.sleep(0.5)
+        print('      bg wait', round(_t.time() - t0, 1), 's')
     for case in [c for c in os.environ.get('SMOKE_V17', '').split(',') if c]:
+        _wait_bg()
         ss['pending_client_choice'] = case
         oks.append(scenario(f'v17 {case} screen', []))
-        store = ss.get('last_result', {}).get('_plan_cache', {})
-        hit = [v for k, v in store.items() if isinstance(k, tuple) and k[0] == case and k[2] == repr(__import__('pending_advice').empty_edits())]
-        print('      plans:', [(p['種類'], p['仍未派']) for p in (hit[0]['plans'] if hit else [])])
+        import analysis_bg
+        _slots = [v for k, v in analysis_bg._REG.items() if k[2] == case and v['state'] == 'done' and v['entry'] is not None]
+        print('      plans:', [(p['種類'], p['仍未派']) for p in (_slots[-1]['entry']['plans'] if _slots else [])])
         oks.append(scenario(f'v17 {case} card click', [f'pending_card_{case}']))
         oks.append(scenario(f'v17 {case} apply plan 1', [f'pending_plan_{case}_0']))
         print('      edits:', ss.get('pending_edits', {}).get(case))
@@ -309,6 +317,7 @@ def main():
         oks.append(scenario(f'v17 {case} reset 2', [f'pending_edit_clear_{case}']))
         oks.append(scenario(f'v17 {case} apply plan again', [f'pending_plan_{case}_0']))
         oks.append(scenario(f'v17 {case} commit', [f'pending_simple_commit_{case}']))
+        _wait_bg()
         oks.append(scenario(f'v17 {case} after commit', []))
         print('      notice/log:', len(ss.get('last_result', {}).get('whole_client_log', []) or []))
     n_after = len(st.session_state.get('pending_client_summary', []))
