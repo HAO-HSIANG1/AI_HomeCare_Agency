@@ -121,7 +121,194 @@ class AgencyTests(unittest.TestCase):
         config=e.PipelineConfig()
         self.assertGreater(e.calc_travel_minutes(25,121.5,25.01,121.51,config,'大眾運輸'),e.calc_travel_minutes(25,121.5,25.01,121.51,config,'機車'))
 
+
+class BackupCaregiverTests(unittest.TestCase):
+    """主責＋固定備援：預設關閉；開啟後僅承接固定人選無法承接的服務。"""
+    def setUp(self):
+        self.provider=patch.object(e,'_get_travel_provider',return_value='local');self.provider.start()
+        self.route=patch.object(e,'get_osrm_travel_time',return_value=5.0);self.route.start()
+        base={'性別':'女','交通工具':'機車','取得資格':'照顧服務員單一級技術士','長照服務人員到期日':'2030-01-01','到職日':'2020-01-01'}
+        self.g=pd.DataFrame([{**base,'編號':'CG_A','休息日':'週日','經度 (WGS84_Lon)':121.50,'緯度 (WGS84_Lat)':25.00},
+                             {**base,'編號':'CG_B','休息日':'週六','經度 (WGS84_Lon)':121.51,'緯度 (WGS84_Lat)':25.01}])
+        self.c=pd.DataFrame([{'內部案號':'CL_A','歷史首選':'CG_A','經度 (WGS84_Lon)':121.505,'緯度 (WGS84_Lat)':25.005}])
+        plan=lambda day:{'案號':'CL_A','星期':day,'開始時間':'09:00:00','結束時間':'10:00:00','服務分鐘':60,'服務項目':'BA13(2)',
+                         '頻率':'每週','生效日':'2026-09-28','經度 (WGS84_Lon)':121.505,'緯度 (WGS84_Lat)':25.005}
+        self.w=pd.DataFrame([plan('星期一'),plan('星期日')])   # 週日是 CG_A 的休息日
+    def tearDown(self):self.provider.stop();self.route.stop()
+    def run_period(self,**flags):
+        from monthly_scheduler import run_fixed_period_dispatch
+        x=e.load_agency_data(self.g,self.c,self.w,'2026-10-05','2026-10-11',availability_confirmed=True)
+        config=e.PipelineConfig(**flags)
+        return run_fixed_period_dispatch(x['Tasks'],x['Caregiver_Profiles'],x['Client_Profiles'],config),config
+    def test_default_off_leaves_rest_day_visit_unassigned(self):
+        result,config=self.run_period()
+        self.assertFalse(config.enable_backup_caregiver)
+        self.assertEqual(len(result['df_result']),1)
+        self.assertEqual(len(result['diagnostics']),1)
+        self.assertEqual(result['client_backup_map'],{})
+    def test_backup_takes_only_what_owner_cannot(self):
+        result,_=self.run_period(enable_backup_caregiver=True)
+        rows=result['df_result'].set_index('排班日期')
+        self.assertEqual(len(rows),2)
+        self.assertEqual(rows.loc['2026-10-05','派單居服員'],'CG_A')       # 固定人選照舊
+        self.assertEqual(rows.loc['2026-10-11','派單居服員'],'CG_B')       # 休息日改由備援
+        self.assertEqual(rows.loc['2026-10-11','排班來源'],'備援居服員')
+        self.assertFalse(rows.loc['2026-10-11','是否請假代班'])
+        self.assertEqual(rows.loc['2026-10-11','固定居服員ID'],'CG_A')
+        self.assertEqual(result['client_backup_map'],{'CL_A':('CG_B',)})
+        self.assertTrue(result['diagnostics'].empty)
+    def test_primary_guard_allows_only_designated_backup(self):
+        from agency_rules import primary_guard
+        task={'案家ID':'CL_A','日期':'2026-10-11','時間窗_開始':'09:00','時間窗_結束':'10:00'}
+        config=e.PipelineConfig(client_primary_map={'CL_A':'CG_A'},client_backup_map={'CL_A':('CG_B',)})
+        self.assertIsNone(primary_guard(task,{'居服員ID':'CG_B'},config))
+        self.assertIn('固定居服員',primary_guard(task,{'居服員ID':'CG_C'},config))
+
+
+class FlexibleDispatchTests(unittest.TestCase):
+    """時段彈性、Excel「歷史備援」優先、寫回 Excel；預設行為不變。"""
+    def setUp(self):
+        self.provider=patch.object(e,'_get_travel_provider',return_value='local');self.provider.start()
+        self.route=patch.object(e,'get_osrm_travel_time',return_value=5.0);self.route.start()
+    def tearDown(self):self.provider.stop();self.route.stop()
+    @staticmethod
+    def worker(code,rest,lon,lat):
+        return {'性別':'女','交通工具':'機車','取得資格':'照顧服務員單一級技術士','長照服務人員到期日':'2030-01-01',
+                '到職日':'2020-01-01','編號':code,'休息日':rest,'經度 (WGS84_Lon)':lon,'緯度 (WGS84_Lat)':lat}
+    @staticmethod
+    def plan(client,day,start,end,minutes):
+        return {'案號':client,'星期':day,'開始時間':start,'結束時間':end,'服務分鐘':minutes,'服務項目':'BA13(2)','頻率':'每週',
+                '生效日':'2026-09-28','經度 (WGS84_Lon)':121.505,'緯度 (WGS84_Lat)':25.005}
+    def run_period(self,workers,clients,plans,start='2026-10-05',end='2026-10-11',**flags):
+        from monthly_scheduler import run_fixed_period_dispatch
+        x=e.load_agency_data(pd.DataFrame(workers),pd.DataFrame(clients),pd.DataFrame(plans),start,end,availability_confirmed=True)
+        config=e.PipelineConfig(**flags)
+        return run_fixed_period_dispatch(x['Tasks'],x['Caregiver_Profiles'],x['Client_Profiles'],config),x
+    def overlap_case(self,**flags):
+        workers=[self.worker('CG_A','週日',121.50,25.00)]
+        clients=[{'內部案號':c,'歷史首選':'CG_A','經度 (WGS84_Lon)':121.505,'緯度 (WGS84_Lat)':25.005} for c in ('CL_A','CL_B')]
+        plans=[self.plan('CL_A','星期一','09:00:00','10:00:00',60),self.plan('CL_B','星期一','09:00:00','10:00:00',60)]
+        return self.run_period(workers,clients,plans,**flags)
+    def test_flex_off_by_default_leaves_overlap_unassigned(self):
+        result,_=self.overlap_case()
+        self.assertEqual(len(result['df_result']),1)
+        self.assertTrue(result['time_shifts'].empty)
+    def test_time_flex_moves_start_but_keeps_duration(self):
+        result,_=self.overlap_case(time_flex_minutes=90)
+        self.assertEqual(len(result['df_result']),2)
+        shift=result['time_shifts'].iloc[0]
+        self.assertEqual(shift['新時段'],'10:15-11:15')           # 同址：只需15分鐘緩衝，最小的15分鐘刻度位移為75
+        self.assertEqual(shift['位移(分)'],75)
+        moved=result['df_result'].set_index('任務ID').loc[shift['任務ID']]
+        self.assertEqual(moved['服務時段'],'10:15-11:15');self.assertEqual(moved['排班來源'],'時段調整')
+        adjusted=result['tasks_adjusted'].set_index('任務ID').loc[shift['任務ID']]
+        self.assertEqual((adjusted['時間窗_開始'],adjusted['時間窗_結束']),('10:15','11:15'))
+        self.assertEqual(adjusted['服務歷時(分鐘)'],60)
+        self.assertTrue(result['diagnostics'].empty)
+    def test_time_flex_too_small_cannot_help(self):
+        result,_=self.overlap_case(time_flex_minutes=60)
+        self.assertEqual(len(result['df_result']),1)
+    def test_per_task_flex_column_overrides_default(self):
+        workers=[self.worker('CG_A','週日',121.50,25.00)]
+        clients=[{'內部案號':c,'歷史首選':'CG_A','經度 (WGS84_Lon)':121.505,'緯度 (WGS84_Lat)':25.005} for c in ('CL_A','CL_B')]
+        plans=[self.plan('CL_A','星期一','09:00:00','10:00:00',60),self.plan('CL_B','星期一','09:00:00','10:00:00',60)]
+        plans[1]['時間彈性(分)']=90
+        result,_=self.run_period(workers,clients,plans)                 # 全域彈性0，只有該列填90
+        self.assertEqual(len(result['df_result']),2)
+    def test_seeded_backup_from_excel_is_tried_first(self):
+        workers=[self.worker('CG_A','週日',121.50,25.00),self.worker('CG_B','週六',121.60,25.10),self.worker('CG_C','週六',121.506,25.006)]
+        plans=[self.plan('CL_A','星期一','09:00:00','10:00:00',60),self.plan('CL_A','星期日','09:00:00','10:00:00',60)]
+        base={'內部案號':'CL_A','歷史首選':'CG_A','經度 (WGS84_Lon)':121.505,'緯度 (WGS84_Lat)':25.005}
+        plain,_=self.run_period(workers,[base],plans,enable_backup_caregiver=True)
+        self.assertEqual(plain['client_backup_map'],{'CL_A':('CG_C',)})     # 無名單：選最近的
+        seeded,_=self.run_period(workers,[{**base,'歷史備援':'CG_B'}],plans,enable_backup_caregiver=True)
+        self.assertEqual(seeded['client_backup_map'],{'CL_A':('CG_B',)})    # 有名單：先試名單上的人
+    def test_default_results_unchanged_by_new_options(self):
+        result,_=self.overlap_case()
+        self.assertEqual(result['client_backup_map'],{})
+        self.assertEqual(result['dispatch_stats'].get('time_shifted_services'),0)
+    def test_workbook_writes_owner_and_backup_columns(self):
+        import io,openpyxl
+        from source_workbook import update_source_workbook
+        wb=openpyxl.Workbook();ws=wb.active;ws.title='個案資料';ws.append(['內部案號','性別']);ws.append(['C1','女']);ws.append(['C2','男'])
+        wb.create_sheet('週服務計畫').append(['案號','開始時間','結束時間']);buf=io.BytesIO();wb.save(buf)
+        out=update_source_workbook(buf.getvalue(),{'C1':'W1'},None,{'C1':'W2、W3','C2':'W9'})
+        sheet=openpyxl.load_workbook(io.BytesIO(out))['個案資料']
+        self.assertEqual([c.value for c in sheet[1]],['內部案號','性別','歷史首選','歷史備援'])
+        self.assertEqual([c.value for c in sheet[2]],['C1','女','W1','W2、W3'])
+        self.assertEqual([c.value for c in sheet[3]],['C2','男',None,'W9'])
+    def test_only_uniform_whole_row_shifts_are_written_back(self):
+        from schedule_assist import weekly_changes_from_shifts
+        tasks=pd.DataFrame({'任務ID':['a1','a2','b1','b2'],'來源列':[2,2,3,3]})
+        shifts=pd.DataFrame([{'來源列':2,'新開始':'10:30','新結束':'11:30'},{'來源列':2,'新開始':'10:30','新結束':'11:30'},
+                             {'來源列':3,'新開始':'10:30','新結束':'11:30'}])
+        changes,skipped=weekly_changes_from_shifts(shifts,tasks)
+        self.assertEqual(changes,{2:{'開始時間':'10:30','結束時間':'11:30'}})
+        self.assertEqual(skipped['來源列'].tolist(),[3])
+    def test_memoized_weekday_and_date_helpers_stay_correct(self):
+        for _ in range(2):
+            self.assertEqual(e.get_weekday_name('2026-10-05'),'星期一')
+            self.assertEqual(e.get_weekday_name(np.nan),'')
+            self.assertEqual(e._date('2026-10-05').isoformat(),'2026-10-05')
+            self.assertIsNone(e._date(''))
+
 if __name__=='__main__':unittest.main()
+
+class PrimaryOptimizerTests(unittest.TestCase):
+    """歷史首選最佳化：模擬規則與引擎一致；超載的首選會被搬給有空的居服員。"""
+    def setUp(self):
+        self.provider=patch.object(e,'_get_travel_provider',return_value='local');self.provider.start()
+        self.route=patch.object(e,'get_osrm_travel_time',return_value=5.0);self.route.start()
+        base={'性別':'女','交通工具':'機車','取得資格':'照顧服務員單一級技術士','長照服務人員到期日':'2030-01-01','到職日':'2020-01-01','休息日':'週日'}
+        self.g=pd.DataFrame([{**base,'編號':'CG_A','經度 (WGS84_Lon)':121.50,'緯度 (WGS84_Lat)':25.00},
+                             {**base,'編號':'CG_B','經度 (WGS84_Lon)':121.51,'緯度 (WGS84_Lat)':25.01}])
+        self.c=pd.DataFrame([{'內部案號':'CL_A','歷史首選':'CG_A','經度 (WGS84_Lon)':121.505,'緯度 (WGS84_Lat)':25.005},
+                             {'內部案號':'CL_B','歷史首選':'CG_A','經度 (WGS84_Lon)':121.506,'緯度 (WGS84_Lat)':25.006}])
+        plan=lambda case:{'案號':case,'星期':'星期一','開始時間':'09:00:00','結束時間':'10:00:00','服務分鐘':60,'服務項目':'BA13(2)',
+                          '頻率':'每週','生效日':'2026-09-28','經度 (WGS84_Lon)':121.505,'緯度 (WGS84_Lat)':25.005}
+        self.w=pd.DataFrame([plan('CL_A'),plan('CL_B')])
+    def tearDown(self):self.provider.stop();self.route.stop()
+    def model(self):
+        from primary_optimizer import PrimaryModel
+        x=e.load_agency_data(self.g,self.c,self.w,'2026-10-05','2026-10-11',availability_confirmed=True)
+        tasks=e.merge_task_client_tables(x['Tasks'],x['Client_Profiles'])
+        return PrimaryModel(tasks,x['Caregiver_Profiles'],e.PipelineConfig(),lambda a,b,c,d,m:5.0)
+    def test_day_error_matches_shared_workload_rules(self):
+        import random
+        from datetime import datetime,timedelta
+        from schedule_checks import workload_error
+        from primary_optimizer import day_error
+        rnd=random.Random(3);base=datetime(2026,10,5)
+        for _ in range(400):
+            n=rnd.randint(1,5);t=rnd.randint(480,600);blocks=[]
+            for _ in range(n):
+                dur=rnd.choice([30,45,60,90,120]);blocks.append((t,t+dur));t+=dur+rnd.choice([0,10,20,30,45,60])
+            transfers=[rnd.choice([0,5,15,25]) for _ in range(n-1)]
+            slots=[(base+timedelta(minutes=a),base+timedelta(minutes=b)) for a,b in blocks]
+            expected=workload_error(slots,8,0,240,30,{i+1:v for i,v in enumerate(transfers)})
+            self.assertEqual(bool(day_error(blocks,480,transfers,240,30)),bool(expected),(blocks,transfers))
+    def test_two_clients_same_slot_cannot_share_one_primary(self):
+        from primary_optimizer import evaluate
+        model=self.model()
+        served,total,_=evaluate(model,{'CL_A':'CG_A','CL_B':'CG_A'})
+        self.assertEqual((served,total),(1,2))
+    def test_optimizer_moves_overloaded_client_and_engine_agrees(self):
+        from primary_optimizer import lns_optimize,evaluate
+        from monthly_scheduler import run_fixed_period_dispatch
+        model=self.model()
+        best,_=lns_optimize(model,{'CL_A':'CG_A','CL_B':'CG_A'},seconds=2,keep_bonus=0.3)
+        self.assertEqual(evaluate(model,best)[:2],(2,2))
+        self.assertEqual(len({best['CL_A'],best['CL_B']}),2)
+        clients=self.c.copy();clients['歷史首選']=clients['內部案號'].map(best)
+        x=e.load_agency_data(self.g,clients,self.w,'2026-10-05','2026-10-11',availability_confirmed=True)
+        result=run_fixed_period_dispatch(x['Tasks'],x['Caregiver_Profiles'],x['Client_Profiles'],e.PipelineConfig())
+        self.assertEqual(len(result['df_result']),2)
+    def test_protected_clients_are_not_moved(self):
+        from primary_optimizer import lns_optimize
+        model=self.model()
+        best,_=lns_optimize(model,{'CL_A':'CG_A','CL_B':'CG_A'},seconds=1,protected={'CL_A','CL_B'})
+        self.assertEqual(best,{'CL_A':'CG_A','CL_B':'CG_A'})
+
 
 class PolicyTests(unittest.TestCase):
     def master(self):
@@ -325,6 +512,24 @@ class HybridTravelTests(unittest.TestCase):
         r=Mock(ok=True,status_code=200)
         row={'status':{},'condition':'ROUTE_EXISTS','duration':'1200s'};row.update(changes)
         r.json.return_value=[row];return r
+    def indexed_response(self):
+        response=self.response();response.json.return_value=[{**response.json.return_value[0],'originIndex':0,'destinationIndex':0}]
+        return response
+    def test_same_weekday_and_clock_share_one_transit_query(self):
+        """同星期、同時刻的大眾運輸查詢，一次排班內只打一次 Google；不同時刻或不同星期仍各自查詢。"""
+        with patch.object(e.requests,'post',return_value=self.indexed_response()) as post:
+            for day in ('2026-10-05','2026-10-12','2026-10-19'):   # 三個星期一
+                self.assertEqual(e.calc_travel_minutes(25,121,25.1,121.1,e.PipelineConfig(),'大眾運輸',departure_time=day+' 10:15'),20)
+            self.assertEqual(post.call_count,1)
+            self.assertEqual(post.call_args.kwargs['json']['departureTime'],'2026-10-05T10:15:00+08:00')
+            e.calc_travel_minutes(25,121,25.1,121.1,e.PipelineConfig(),'大眾運輸',departure_time='2026-10-06 10:15')  # 星期二
+            e.calc_travel_minutes(25,121,25.1,121.1,e.PipelineConfig(),'大眾運輸',departure_time='2026-10-12 11:15')  # 同星期不同時刻
+            self.assertEqual(post.call_count,3)
+    def test_weekday_reuse_can_be_turned_off(self):
+        with patch.object(e,'GOOGLE_TRANSIT_REUSE_WEEKDAY',False),patch.object(e.requests,'post',return_value=self.indexed_response()) as post:
+            for day in ('2026-10-05','2026-10-12'):
+                e.calc_travel_minutes(25,121,25.1,121.1,e.PipelineConfig(),'大眾運輸',departure_time=day+' 10:15')
+            self.assertEqual(post.call_count,2)
     def test_mixed_mode_routes_and_timed_query_memo(self):
         with patch.object(e,'get_osrm_travel_time',return_value=3) as motor,patch.object(e.requests,'post',return_value=self.response()) as post:
             self.assertEqual(e.calc_travel_minutes(25,121,25.1,121.1,e.PipelineConfig(),'機車'),3)
@@ -346,9 +551,9 @@ class HybridTravelTests(unittest.TestCase):
         with patch.object(e.requests,'post',return_value=self.response()) as post:
             out=e.calculate_schedule_travel(result,tasks,cg,e.PipelineConfig(buffer_mins=15))
         bodies=[c.kwargs['json'] for c in post.call_args_list]
-        self.assertIn('arrivalTime',bodies[0])
-        self.assertIn('departureTime',bodies[1])
-        self.assertTrue(bodies[1]['departureTime'].endswith('10:15:00+08:00'))
+        # 路段會批次平行預抓，請求順序不固定：首案用抵達時間，次案用「前案結束＋緩衝」出發。
+        self.assertTrue(any('arrivalTime' in b and b['arrivalTime'].endswith('09:00:00+08:00') for b in bodies))
+        self.assertTrue(any(b.get('departureTime','').endswith('10:15:00+08:00') for b in bodies))
         self.assertTrue(out['交通估算來源'].str.contains('Google Maps').all())
     def test_missing_key_errors_without_osrm_fallback(self):
         with patch.object(e,'_get_google_maps_api_key',return_value=None),patch.object(e,'get_osrm_travel_time') as motor:

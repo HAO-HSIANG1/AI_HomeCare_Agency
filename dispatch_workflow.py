@@ -1,4 +1,5 @@
 """Unified local dispatch follow-up and availability. No external messages are sent."""
+CAREFLOW_BUILD = '2026.10.11-v17'
 import hashlib
 import json
 import sqlite3
@@ -46,19 +47,47 @@ class WorkflowStore:
             db.execute('CREATE TABLE IF NOT EXISTS blocks(id INTEGER PRIMARY KEY, scope TEXT, cg TEXT, start TEXT, end TEXT, reason TEXT)')
             db.execute('CREATE TABLE IF NOT EXISTS pending(scope TEXT, task TEXT, body TEXT, PRIMARY KEY(scope,task))')
             db.execute('CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, scope TEXT, task TEXT, at TEXT, body TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS client_primary(scope TEXT, client TEXT, cg TEXT, updated TEXT, PRIMARY KEY(scope,client))')
     def connect(self): return sqlite3.connect(self.path, timeout=15)
+    def primary_map(self):
+        with self.connect() as db:
+            return dict(db.execute('SELECT client,cg FROM client_primary WHERE scope=?',(self.scope,)).fetchall())
+    def save_primary_map(self, mapping):
+        """Save reviewed client owners; backups never become owners implicitly."""
+        with self.connect() as db:
+            for client,cg in mapping.items():
+                if not str(client).strip() or not str(cg).strip():
+                    raise ValueError('固定案家與居服員編號不可空白。')
+                old=db.execute('SELECT cg FROM client_primary WHERE scope=? AND client=?',(self.scope,str(client))).fetchone()
+                if old and old[0]!=str(cg):
+                    raise ValueError(f'案家 {client} 已有固定居服員 {old[0]}，代班不能取代固定人選。')
+                db.execute('INSERT OR REPLACE INTO client_primary VALUES(?,?,?,?)',(self.scope,str(client),str(cg),stamp()))
+            db.execute('INSERT INTO history(scope,task,at,body) VALUES(?,?,?,?)',(self.scope,'client_primary',stamp(),json.dumps(mapping,ensure_ascii=False)))
     def get(self, tid):
         with self.connect() as db:
             row=db.execute('SELECT body FROM records WHERE scope=? AND task=?',(self.scope,str(tid))).fetchone()
         return json.loads(row[0]) if row else {}
+    def all_records(self):
+        with self.connect() as db:
+            return {tid:json.loads(body) for tid,body in db.execute('SELECT task,body FROM records WHERE scope=?',(self.scope,))}
+    def set_reviewed_primary(self, client, cg, reason):
+        """Explicit supervisor whole-client choice, never an automatic backup."""
+        if not str(client).strip() or not str(cg).strip() or not reason.strip():
+            raise ValueError('請提供案家、固定居服員與整案調整原因。')
+        with self.connect() as db:
+            old=db.execute('SELECT cg FROM client_primary WHERE scope=? AND client=?',(self.scope,str(client))).fetchone()
+            db.execute('INSERT OR REPLACE INTO client_primary VALUES(?,?,?,?)',(self.scope,str(client),str(cg),stamp()))
+            body={'client':str(client),'old':old[0] if old else '', 'new':str(cg),'reason':reason,'kind':'supervisor_whole_client'}
+            db.execute('INSERT INTO history(scope,task,at,body) VALUES(?,?,?,?)',(self.scope,'client_primary',stamp(),json.dumps(body,ensure_ascii=False)))
     def save(self, tid, record):
         record = {**record, 'updated':stamp()}
         body=json.dumps(record,ensure_ascii=False,default=str)
         with self.connect() as db:
             db.execute('INSERT OR REPLACE INTO records VALUES(?,?,?)',(self.scope,str(tid),body))
             db.execute('INSERT INTO history(scope,task,at,body) VALUES(?,?,?,?)',(self.scope,str(tid),stamp(),body))
-    def record(self, task, cg, confirmed=False):
-        old=self.get(task['任務ID']);sig=task_signature(task,cg)
+    def record(self, task, cg, confirmed=False, cached=None):
+        old=self.get(task['任務ID']) if cached is None else cached
+        sig=task_signature(task,cg)
         if old.get('signature')==sig:return old
         # Replies apply only to the exact person/date/time, never to a changed assignment.
         record = {'signature':sig,'cg':cg or '', 'state':('督導確認' if confirmed else '建議') if cg else '待安排',
@@ -112,7 +141,7 @@ def attach_blocks(frame, store):
 
 def render_leave(store, caregivers, tasks, result, overrides):
     import streamlit as st
-    st.caption('整天或多段時段共用同一流程。登錄後，重疊服務會轉為待安排；其他時段保留。')
+    st.caption('整天或多段時段共用同一流程。登錄「請假」後，重疊服務開放代班；其他不可排原因只阻擋派單，固定人選保留。')
     labels={str(r['居服員ID']):str(r['居服員ID']) for _,r in caregivers.iterrows()}
     names=st.session_state.get('_workflow_cg_labels',{})
     if not labels:
@@ -131,8 +160,9 @@ def render_leave(store, caregivers, tasks, result, overrides):
             store.add_blocks(cg,day.isoformat(),spans,reason)
             assignment=dict(zip(result.get('任務ID',[]),result.get('派單居服員',[])))
             affected=sum(1 for _,t in tasks.iterrows() if str(assignment.get(t['任務ID'],''))==str(cg) and any(b['cg']==str(cg) and overlap(t,b) for b in store.blocks()))
-            st.session_state['workflow_go_queue']=True
-            st.session_state['workflow_notice']=f'已登錄不可排時間，本次有 {affected} 筆已派服務受影響，已轉至接單與待辦。'
+            st.session_state['workflow_notice']=f'已登錄不可排時間，本次有 {affected} 筆已派服務受影響，已標為待安排，請到「人工調整班表」改派。'
+            if reason=='請假' and affected:
+                st.session_state['auto_cover_cg']=cg   # 下一次畫面更新時自動找代班
             st.rerun()
         except ValueError as exc:st.error(str(exc))
     blocks=store.blocks()
@@ -142,97 +172,5 @@ def render_leave(store, caregivers, tasks, result, overrides):
             bid=st.selectbox('撤銷時段', [b['id'] for b in blocks])
             if st.button('撤銷選取時段'):
                 store.remove_block(bid)
-                st.session_state['workflow_notice']='已撤銷不可排時段；已改派或待安排服務不會自動還原，請到接單與待辦確認。'
+                st.session_state['workflow_notice']='已撤銷不可排時段；已改派的服務不會自動還原。'
                 st.rerun()
-
-def render_queue(store, tasks, result, caregivers, overrides, on_assign, on_rank, on_move, find_slots):
-    import streamlit as st
-    mapping=dict(zip(result.get('任務ID',[]).astype(str),result.get('派單居服員',[]))) if not result.empty else {}
-    records={}; table=[];names=st.session_state.get('_workflow_cg_labels',{}); clients=st.session_state.get('_workflow_cl_labels',{})
-    for _,task in tasks.drop_duplicates('任務ID').iterrows():
-        tid=str(task['任務ID']);cg=str(mapping.get(tid,'') or '')
-        if cg in ['nan','未指派','None']:cg=''
-        record=store.record(task,cg,tid in overrides)
-        if not cg and not record.get('note'):record['note']=overrides.get(tid,{}).get('reason','')
-        records[tid]=(task,cg,record)
-        due=pd.to_datetime(record.get('due'),errors='coerce')
-        overdue=pd.notna(due) and due.date()<datetime.now(ZoneInfo('Asia/Taipei')).date() and record['state']!='已通知案家'
-        table.append({'任務ID':tid,'日期':str(task.get('日期',''))[:10],'時段':str(task.get('時間窗_開始',''))+'–'+str(task.get('時間窗_結束','')),'案家':clients.get(str(task.get('案家ID')),str(task.get('案家ID',''))),'居服員':names.get(cg,cg or '未安排'),'狀態':record['state'],'追蹤人':record.get('owner',''),'期限':record.get('due',''),'逾期':'逾期' if overdue else ''})
-    df=pd.DataFrame(table)
-    if df.empty:st.info('目前沒有服務任務。');return
-    st.caption('追蹤人為人工填寫，非登入驗證。此處統一登錄電話／訊息回覆，不會自動發送通知。待回覆的人選仍保留時段，避免重複安排；拒接後釋出。')
-    a,b,c=st.columns(3);a.metric('待安排',int((df['狀態']=='待安排').sum()));b.metric('待接單確認',int(df['狀態'].isin(STATES[:3]).sum()));c.metric('已接單／已通知',int(df['狀態'].isin(STATES[3:]).sum()))
-    view=st.radio('查看',['待處理','全部'],horizontal=True,key='workflow_filter')
-    search=st.text_input('搜尋案家、居服員或任務',key='workflow_search')
-    shown=df if view=='全部' else df[df['狀態']!='已通知案家']
-    if search:shown=shown[shown.astype(str).apply(lambda r:r.str.contains(search,regex=False).any(),axis=1)]
-    st.dataframe(shown,hide_index=True,width='stretch')
-    if shown.empty:return
-    index=shown.set_index('任務ID')
-    tid=st.selectbox('選取一筆處理',shown['任務ID'].tolist(),format_func=lambda t:f"{index.loc[t,'日期']} {index.loc[t,'時段']} · {index.loc[t,'案家']} · {t}")
-    task,cg,record=records[tid];key=tid+record['signature'][:8]
-    st.write(f"目前：{record['state']} · {names.get(cg,cg or '未安排')}")
-    if not cg and record.get('note'):st.warning(record['note'])
-    if record.get('previous_state'):st.caption('人選或時段已變更，前次接單／通知狀態不再適用。')
-    if cg:
-        with st.form('reply_'+key):
-            target=st.selectbox('更新狀態',STATES,index=STATES.index(record['state']) if record['state'] in STATES else 0)
-            note=st.text_input('聯繫／確認紀錄',value=record.get('note',''))
-            checked=st.checkbox('已向居服員確認接單；如選已通知案家，也已完成案家通知')
-            if st.form_submit_button('儲存狀態',type='primary'):
-                if target in STATES[3:] and (not checked or not note.strip()):st.error('請勾選實際確認結果並填寫聯繫紀錄。')
-                else:store.save(tid,{**record,'state':target,'note':note});st.rerun()
-        with st.expander('拒接／撤回人選'):
-            reason=st.text_input('拒接或撤回原因',key='reject_'+key)
-            if st.button('釋出人選並轉待安排',key='release_'+key):
-                if not reason.strip():st.error('請填寫原因。')
-                else:
-                    error=on_assign(tid,None,reason)
-                    if error:st.error(error)
-                    else:
-                        store.save(tid,{**store.record(task,''),'note':reason,'rejected_cg':cg,'rejected_signature':task_signature(task,cg)});st.rerun()
-    with st.expander('找人／無人可派處理',expanded=not bool(cg)):
-        if st.button('重新檢查所有候選人',key='rank_'+key):
-            with st.spinner('檢查資格、可上班時段、工時與交通…'):
-                try:ranked=on_rank(tid,list(caregivers['居服員ID'].astype(str)))
-                except Exception as exc:
-                    st.error('候選檢查未完成：'+str(exc));ranked=[]
-            st.session_state['workflow_rank']={'key':key,'rows':ranked}
-        saved=st.session_state.get('workflow_rank',{})
-        ranked=saved.get('rows',[]) if saved.get('key')==key else []
-        if ranked:
-            st.dataframe(pd.DataFrame([{'居服員':names.get(str(r['cg_id']),str(r['cg_id'])),'可派':bool(r.get('available')),'原因':r.get('detail') or r.get('reason','')} for r in ranked]),hide_index=True,width='stretch')
-            available=[str(r['cg_id']) for r in ranked if r.get('available')]
-            if available:
-                choice=st.selectbox('備援／接手人員',available,format_func=lambda x:names.get(x,x),key='choice_'+key)
-                if st.button('督導確認此人選',key='assign_'+key):
-                    error=on_assign(tid,choice,'統一待辦選擇接手人員')
-                    if error:st.error(error)
-                    else:
-                        store.save(tid,{**store.record(task,choice,True),'state':'督導確認'});st.session_state.pop('workflow_rank',None);st.rerun()
-            else:st.warning('目前無可派人選。請登錄追蹤期限，協商其他時間或聯絡備援人力。')
-        if st.button('找可協商時段（前後 30／60 分鐘）',key='slots_'+key):
-            with st.spinner('重新檢查替代時段…'):
-                try:options=find_slots(task)
-                except Exception as exc:
-                    st.error('協商時段檢查未完成：'+str(exc));options=[]
-            st.session_state['workflow_slots']={'key':key,'rows':options}
-        found=st.session_state.get('workflow_slots',{})
-        slots=found.get('rows',[]) if found.get('key')==key else []
-        if found.get('key')==key and not slots:st.info('前後 30／60 分鐘內未找到可行方案；可回「案家臨時改期」協商其他日期。')
-        if slots:
-            selected=st.selectbox('可協商方案',range(len(slots)),format_func=lambda i:f"{slots[i]['start']}–{slots[i]['end']} · {names.get(slots[i]['cg_id'],slots[i]['cg_id'])}",key='slot_'+key)
-            agreed=st.checkbox('已與案家協商同意新時段',key='agree_'+key)
-            if st.button('確認改期人選（仍待接單）',disabled=not agreed,key='applyslot_'+key):
-                error=on_move(slots[selected],'案家已同意協商時段','僅本次')
-                if error:st.error(error)
-                else:st.session_state.pop('workflow_slots',None);st.rerun()
-    with st.expander('追蹤人、期限與處理紀錄'):
-        with st.form('follow_'+key):
-            owner=st.text_input('負責追蹤人',value=record.get('owner',''))
-            due=st.date_input('追蹤期限',value=pd.Timestamp(record['due']).date() if record.get('due') else None)
-            note=st.text_area('處理紀錄／待協商事項',value=record.get('note',''))
-            if st.form_submit_button('儲存追蹤'):
-                store.save(tid,{**record,'owner':owner,'due':due.isoformat() if due else '', 'note':note});st.rerun()
-        history=store.history(tid)
-        if history:st.dataframe(pd.DataFrame([{'時間':at, '狀態':json.loads(body).get('state',''),'紀錄':json.loads(body).get('note','')} for at,body in history]),hide_index=True,width='stretch')

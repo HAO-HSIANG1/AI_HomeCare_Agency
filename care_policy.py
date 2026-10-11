@@ -23,7 +23,10 @@ def text(value):
  return str(value).strip()
 
 def certificate_names(cg):
- raw_parts=re.split(r'[、,，;；\n]',text(cg.get('取得資格'))+'、'+text(cg.get('核心專長證照')))
+ # Imported qualification text is authoritative. A cached derived specialty
+ # must never restore a qualification deleted in Excel or the editor.
+ raw_source=text(cg.get('取得資格')) if '取得資格' in cg else text(cg.get('核心專長證照'))
+ raw_parts=re.split(r'[、,，;；\n]',raw_source)
  raw='、'.join(p for p in raw_parts if not any(n in p for n in ['未完成','未取得','未受訓','尚未','無此'])).upper()
  return {name for name,aliases in CERT_ALIASES.items() if any(a.upper() in raw for a in aliases)}
 
@@ -65,7 +68,7 @@ def is_confirmed(value):
  return text(value).lower() in {'1','1.0','是','已確認','已登錄','true'}
 
 def dementia_status(task):
- value=text(task.get('失智症個案(0/1)'))
+ value=text(task.get('是否失智')) if '是否失智' in task else text(task.get('失智症個案(0/1)'))
  if is_confirmed(value):return True
  if value.lower() in {'0','0.0','否','false'}:return False
  # 只接受已由操作者明確指定的照護需求，不從身障第1類推論。
@@ -77,6 +80,6 @@ def special_qualification_error(task,cg,code_requirements):
  if dementia_status(task) is True:needed.add('失智症照顧專長')
  certs=certificate_names(cg)
  for cert in sorted(needed):
-  if cert not in certs and cert not in text(cg.get('核心專長證照')).split('、'):
+  if cert not in certs and not ('取得資格' not in cg and cert in text(cg.get('核心專長證照')).split('、')):
    return '缺特殊訓練：'+cert
  return None

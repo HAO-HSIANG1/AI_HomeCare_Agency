@@ -1,4 +1,5 @@
 """Pure operational schedule/route views. Rendering and export never call map APIs."""
+CAREFLOW_BUILD = '2026.10.11-v17'
 from io import BytesIO
 import hashlib
 import json
@@ -25,6 +26,12 @@ def day_string(value):
     value = text(value)
     if not value or value == '單日':
         return value
+    if len(value) >= 10 and value[4:5] == '-' and value[7:8] == '-':
+        from datetime import datetime
+        try:
+            return datetime.fromisoformat(value).date().isoformat()
+        except ValueError:
+            pass
     parsed = pd.to_datetime(value, errors='coerce')
     return parsed.strftime('%Y-%m-%d') if pd.notna(parsed) else value
 
@@ -33,6 +40,9 @@ def clock(value):
     value = text(value)
     if not value:
         return ''
+    if len(value) == 5 and value[2] == ':' and value[:2].isdigit() and value[3:].isdigit():
+        if int(value[:2]) < 24 and int(value[3:]) < 60:
+            return value
     parsed = pd.to_datetime(value, errors='coerce')
     return parsed.strftime('%H:%M') if pd.notna(parsed) else value
 
@@ -48,7 +58,7 @@ def describe_routes(assignments, tasks, caregivers, buffer_mins=15):
     task_map = tasks.drop_duplicates('任務ID', keep='last').set_index('任務ID').to_dict('index')
     cg_map = caregivers.drop_duplicates('居服員ID', keep='last').set_index('居服員ID').to_dict('index')
     groups = {}
-    for _, row in assignments.drop_duplicates('任務ID', keep='last').iterrows():
+    for row in assignments.drop_duplicates('任務ID', keep='last').to_dict('records'):
         task_id, cg_id = text(row.get('任務ID')), text(row.get('派單居服員'))
         if cg_id in ('', '未指派') or task_id not in task_map:
             continue
@@ -56,6 +66,7 @@ def describe_routes(assignments, tasks, caregivers, buffer_mins=15):
         day = day_string(task.get('日期')) or day_string(row.get('排班日期')) or '單日'
         groups.setdefault((cg_id, day), []).append(task_id)
     rows = []
+    stamp_cache = {}
     for (cg_id, day), task_ids in sorted(groups.items()):
         cg = cg_map.get(cg_id, {})
         mode = text(cg.get('常用交通工具')) or text(cg.get('交通工具')) or '未提供'
@@ -72,15 +83,20 @@ def describe_routes(assignments, tasks, caregivers, buffer_mins=15):
             lat1 = number(cg.get('服務起點_緯度(家)')) if first else number(prev.get('服務地點_緯度'))
             lon1 = number(cg.get('服務起點_經度(家)')) if first else number(prev.get('服務地點_經度'))
             lat2, lon2 = number(task.get('服務地點_緯度')), number(task.get('服務地點_經度'))
-            buffer = 0.0 if first else float(buffer_mins)
+            buffer = 0.0 if first or origin_id == text(task.get('案家ID')) else float(buffer_mins)
             query_clock = clock(task.get('時間窗_開始')) if first else clock(prev.get('時間窗_結束'))
             query_time = ''
             if day != '單日' and query_clock:
-                ts = pd.to_datetime(day + ' ' + query_clock, errors='coerce')
-                if pd.notna(ts):
-                    if not first:
-                        ts += pd.Timedelta(minutes=buffer)
-                    query_time = ts.tz_localize('Asia/Taipei').isoformat()
+                stamp = (day, query_clock, 0.0 if first else buffer)
+                if stamp not in stamp_cache:
+                    ts = pd.to_datetime(day + ' ' + query_clock, errors='coerce')
+                    if pd.notna(ts):
+                        if not first:
+                            ts += pd.Timedelta(minutes=buffer)
+                        stamp_cache[stamp] = ts.tz_localize('Asia/Taipei').isoformat()
+                    else:
+                        stamp_cache[stamp] = ''
+                query_time = stamp_cache[stamp]
             fingerprint = [task_id, cg_id, day, clock(task.get('時間窗_開始')),
                            clock(task.get('時間窗_結束')), mode, prev_id, query_time,
                            lat1, lon1, lat2, lon2, buffer]
@@ -95,7 +111,7 @@ def describe_routes(assignments, tasks, caregivers, buffer_mins=15):
 
 MAIN_COLUMNS = ['日期', '星期', '開始時間', '結束時間', '案號', '派單居服員', '服務項目',
                 '服務分鐘', '出發地', '交通方式', '交通時間', '路段緩衝(分)',
-                '含緩衝交通時間(分)', '交通計算狀態', '接單狀態', '任務ID']
+                '含緩衝交通時間(分)', '交通計算狀態', '任務ID']
 
 
 def build_schedule_output(tasks, assignments, caregivers, routes, metadata=None, buffer_mins=15):
@@ -159,7 +175,7 @@ def build_schedule_output(tasks, assignments, caregivers, routes, metadata=None,
     return out[order].sort_values(['日期', '開始時間', '派單居服員', '任務ID'], na_position='last').reset_index(drop=True)
 
 
-def schedule_excel_bytes(schedule):
+def schedule_excel_bytes(schedule, daily_payroll=None, monthly_payroll=None, primary_map=None, diagnostics=None):
     """Export familiar weekly-plan columns plus an auditable per-leg worksheet."""
     route_columns = ['日期', '任務ID', '案號', '派單居服員', '開始時間', '結束時間', '交通方式',
                      '出發地類型', '出發地', '起點案號', '前一任務ID', '前案結束時間',
@@ -174,13 +190,38 @@ def schedule_excel_bytes(schedule):
         ('交通查詢方式', '首案以服務開始作為到達條件；後續案以前案結束+轉場緩衝作為出發條件。OSRM不提供即時交通預測。'),
         ('路段緩衝(分)', '獨立預留停車、步行、門禁等時間；首案顯示0，不代表出門與門禁不用時間。'),
         ('交通資料簽章', '用於防止改派／改期／插單後沿用舊路段交通。交通估算仍須人工核對或實測。'),
-        ('班表範圍', '含未指派與臨時插單。逐段交通不含最後一案返家。接單狀態另列，指派不代表已接受服務。'),
+        ('班表範圍', '含未指派與臨時插單。逐段交通不含最後一案返家。指派結果為排班建議。'),
+        ('固定居服員ID', '每案家跨所有星期與時段固定同一人；已登錄且與服務重疊的請假才開放代班，代班不覆寫固定人選。'),
+        ('SA10計費', '全部為自費，一單位一小時，採設定之自費時薪估價；不計入公費給付。若來源單位與時段不符，保留來源時段並列提醒。'),
+        ('服務基本工資', '實際排定服務分鐘÷60×設定時薪（預設210）。與服務收費無關。'),
+        ('轉場工資', '同人同日依有效服務順序，每次不同案家間轉場46元；不另加210×轉場小時。首案通勤、末案返家及同案接續服務不計轉場工資。'),
+        ('加班加給', '一般工作日服務加轉場與工作緩衝超過8小時，前2小時加給210×0.34，後2小時加給210×0.67；基本工資已另列，避免再付完整倍率。非休息日／例假日／國定假日完整薪資結算。'),
+        ('月工時檢查', '本次有效班表逐日超過8小時的時數加總，預設上限46小時；可加員工欄位「排班期外本月加班時數」。未提供之期外出勤需另核對。'),
     ], columns=['欄位', '說明'])
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         schedule.to_excel(writer, sheet_name='班表', index=False)
         schedule.reindex(columns=route_columns).to_excel(writer, sheet_name='逐段交通', index=False)
+        if '日期' in schedule and ('案家ID' in schedule or '案號' in schedule):
+            from pending_clients import pending_client_summary
+            view = schedule.copy()
+            for target,source in [('案家ID','案號'),('時間窗_開始','開始時間'),('時間窗_結束','結束時間')]:
+                if target not in view and source in view:
+                    view[target]=view[source]
+            pending_client_summary(view,view,diagnostics,primary_map).to_excel(writer,sheet_name='未派案家',index=False)
+        if diagnostics is not None:
+            pending = diagnostics.copy()
+            if '逐人排班原因' in pending:
+                import json
+                pending['逐人排班原因']=pending['逐人排班原因'].map(lambda v:json.dumps(v,ensure_ascii=False) if isinstance(v,dict) else v)
+            pending.to_excel(writer,sheet_name='未派原因',index=False)
         notes.to_excel(writer, sheet_name='欄位說明', index=False)
+        if daily_payroll is not None:
+            daily_payroll.to_excel(writer, sheet_name='每日工資估算', index=False)
+        if monthly_payroll is not None:
+            monthly_payroll.to_excel(writer, sheet_name='每月工資估算', index=False)
+        if primary_map is not None:
+            pd.DataFrame([{'案家ID':client,'固定居服員ID':worker} for client,worker in sorted(primary_map.items())], columns=['案家ID','固定居服員ID']).to_excel(writer, sheet_name='固定居服員', index=False)
         from openpyxl.styles import Alignment, Font, PatternFill
         for ws in writer.book:
             ws.freeze_panes = 'E2' if ws.title == '班表' else 'A2'

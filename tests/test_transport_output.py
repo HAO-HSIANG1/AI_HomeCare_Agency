@@ -36,9 +36,18 @@ class Updates(unittest.TestCase):
         self.assertEqual(out.loc['T1','交通時間'],10)
         self.assertTrue(pd.isna(out.loc['T4','交通時間']))
         book = load_workbook(BytesIO(schedule_excel_bytes(out.reset_index())))
-        self.assertEqual(book.sheetnames,['班表','逐段交通','欄位說明'])
+        self.assertEqual(book.sheetnames,['班表','逐段交通','未派案家','欄位說明'])
         headers=[c.value for c in book['班表'][1]]
         self.assertEqual(book['班表'].cell(2,headers.index('派單居服員')+1).value,'03816')
+        # 精簡：保留起訖座標、交通時間與方式；同義重複欄（案家ID、時間窗_開始、服務地點_緯度…）不輸出
+        for col in ['出發地緯度','出發地經度','終點緯度','終點經度','交通時間(分)','交通方式']:
+            self.assertIn(col, headers)
+        for col in ['案家ID','時間窗_開始','服務地點_緯度','最終派單居服員','預估車程(分)','交通資料簽章']:
+            self.assertNotIn(col, headers)
+        self.assertEqual(len(headers), len(set(headers)))
+        pending=[c.value for c in book['未派案家'][1]]
+        self.assertEqual(book['未派案家'].cell(2,1).value,'A4')
+        self.assertIn('案家緯度', pending); self.assertNotIn('已派服務數', pending)
     def test_timestamp_dates_preserve_taipei_query_time(self):
         tasks=self.tasks.copy();tasks['日期']=pd.to_datetime(tasks['日期'])
         sequence=describe_routes(self.assign,tasks,self.cg).set_index('任務ID')

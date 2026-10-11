@@ -1,4 +1,5 @@
 """CareFlow 班表工作台：單日全員、個人整週與異動清單。"""
+CAREFLOW_BUILD = '2026.10.11-v17'
 from datetime import date, datetime, timedelta
 import re
 import pandas as pd
@@ -25,6 +26,7 @@ def build_schedule_rows(result, tasks, caregivers, overrides=None, client_names=
     task_rows = tasks.drop_duplicates("任務ID") if "任務ID" in tasks else pd.DataFrame()
     assigned = apply_overrides_to_result(result, overrides)
     assigned_map = dict(zip(assigned.get("任務ID", []), assigned.get("派單居服員", [])))
+    source_rows = assigned.set_index('任務ID').to_dict('index') if not assigned.empty else {}
     cg_ids = [str(x) for x in caregivers.get("居服員ID", pd.Series(dtype=object)).dropna().unique()]
     name_map_clients = {str(k): str(v) for k, v in (client_names or {}).items()}
     rows = []
@@ -40,6 +42,8 @@ def build_schedule_rows(result, tasks, caregivers, overrides=None, client_names=
         client_id = str(row.get("案家ID", ""))
         recurrence = str(row.get("頻率", ""))
         tag = "隔週" if "隔週" in recurrence or "隔周" in recurrence else "每週" if "每週" in recurrence else "單次"
+        if source_rows.get(task_id, {}).get('是否請假代班') is True:
+            tag = '代班'
         override = (overrides or {}).get(task_id)
         if override and override.get("cg_id"):
             tag = "代班" if "請假" in str(override.get("reason", "")) else "已調整"
@@ -55,52 +59,78 @@ def build_schedule_rows(result, tasks, caregivers, overrides=None, client_names=
 
 
 _GRID_CSS = """
-.cf-workspace {font-family:var(--st-font),sans-serif; color:#183d3d; overflow:auto; max-height:780px; border:1px solid #dae8e2;border-radius:16px;background:#fff}
-.cf-head {display:grid;position:sticky;top:0;z-index:5;background:#f1f7f4;border-bottom:1px solid #dce9e3}
-.cf-head div {min-width:155px;padding:13px 10px;font-size:13px;font-weight:750;border-left:1px solid #e3eee8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.cf-head div:first-child {min-width:64px;border-left:0}
-.cf-board {position:relative;display:grid;min-width:max-content}
-.cf-time {position:absolute;left:0;width:64px;text-align:center;color:#6b807b;font-size:12px;padding-top:2px}
-.cf-lane {position:relative;min-width:155px;border-left:1px solid #e3eee8;background:repeating-linear-gradient(to bottom,#fff 0,#fff 83px,#edf3ef 84px)}
-.cf-card {position:absolute;left:5px;right:5px;overflow:hidden;border:1px solid #a9d9c7;border-left:4px solid #16816c;border-radius:8px;background:#dff4eb;padding:5px 7px;box-sizing:border-box;cursor:pointer;font-size:12px;line-height:1.4;z-index:2}
-.cf-card strong {display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px;padding-right:22px}
-.cf-card span {display:block}
+.cf-workspace {--px:64px;font-family:var(--st-font),sans-serif; color:#183d3d; overflow:auto; max-height:min(760px,78vh); border:1px solid #dae8e2;border-radius:16px;background:#fff;scroll-behavior:smooth}
+.cf-head {display:grid;position:sticky;top:0;z-index:5;background:#f1f7f4;border-bottom:1px solid #cfe2d9}
+.cf-head div {padding:8px 6px;font-size:13px;font-weight:750;border-left:1px solid #e3eee8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;text-align:center}
+.cf-head div:first-child {border-left:0;color:#6b807b;font-weight:600;font-size:12px;display:flex;align-items:center;justify-content:center}
+.cf-head .cf-dn {display:block;font-size:12px;font-weight:600;color:#5f7a72;letter-spacing:.04em}
+.cf-head .cf-dd {display:block;font-size:17px;font-weight:800;line-height:1.25;color:#17493f}
+.cf-head .cf-cnt {display:block;font-size:11px;font-weight:600;color:#7a918a}
+.cf-head .cf-wk {background:#fbf0ee}
+.cf-head .cf-wk .cf-dn,.cf-head .cf-wk .cf-dd {color:#b0503f}
+.cf-head .cf-today .cf-dd {display:inline-block;min-width:30px;border-radius:999px;background:#127b6b;color:#fff;padding:0 7px}
+.cf-board {position:relative;display:grid}
+.cf-time {position:absolute;left:0;right:0;text-align:center;color:#6b807b;font-size:11.5px;transform:translateY(-8px)}
+.cf-lane {position:relative;min-width:0;border-left:1px solid #e3eee8;background-color:#fff;background-image:linear-gradient(to bottom,transparent calc(100% - 1px),#edf3ef 0);background-size:100% var(--px)}
+.cf-lane.cf-wk {background-color:#fffbfa}
+.cf-card {position:absolute;left:3px;right:3px;overflow:hidden;border:1px solid #a9d9c7;border-left:4px solid #16816c;border-radius:8px;background:#dff4eb;padding:4px 6px;box-sizing:border-box;cursor:pointer;font-size:12px;line-height:1.35;z-index:2;user-select:none;transition:box-shadow .12s}
+.cf-card:hover {box-shadow:0 3px 10px #0f4b3f33;z-index:3}
+.cf-card strong {display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12.5px;padding-right:20px}
+.cf-card span {display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cf-card .cf-event-time {font-variant-numeric:tabular-nums;color:#285a4e}
+.cf-week .cf-card {font-size:11px;padding:3px 5px}
+.cf-week .cf-card strong {font-size:12px;padding-right:16px}
+.cf-week .cf-handle {font-size:14px;line-height:16px;padding:1px 3px}
 .cf-card[data-tag="隔週"] {background:#eeebff;border-color:#c7bcf5;border-left-color:#8067ce}
 .cf-card[data-tag="代班"],.cf-card[data-tag="已調整"] {background:#fff1d9;border-color:#f4d394;border-left-color:#e49a19}
 .cf-card:focus {outline:2px solid #127b6b;outline-offset:1px}
 .cf-card[draggable="true"]:active {cursor:grabbing}
-.cf-lane.cf-over {background-color:#f0f9f5}
+.cf-lane.cf-over {background-color:#f0f9f5;box-shadow:inset 0 0 0 2px #248974}
 .cf-hint {color:#667e76;font-size:12px;margin:9px 0}
 .cf-handle {position:absolute;right:2px;top:2px;border:0;border-radius:5px;background:#ffffffaa;color:#155b4d;padding:2px 5px;cursor:grab;touch-action:none;user-select:none;font-size:18px;line-height:22px}
-.cf-details {position:absolute;bottom:3px;right:6px;border:0;background:transparent;color:#175b4d;text-decoration:underline;cursor:pointer;padding:0;margin-top:2px;font-size:12px}
-.cf-live {padding:9px 12px;margin-bottom:8px;background:#eaf5ee;color:#235b4b;border-radius:8px;font-size:13px;min-height:22px}
+.cf-details {position:absolute;bottom:2px;right:5px;border:0;background:transparent;color:#175b4d;text-decoration:underline;cursor:pointer;padding:0;font-size:11px}
+.cf-live {padding:7px 12px;margin-bottom:8px;background:#eaf5ee;color:#235b4b;border-radius:8px;font-size:13px;min-height:20px}
 .cf-drag-ghost {position:fixed;pointer-events:none;z-index:10000;background:#135e50;color:white;white-space:pre-line;padding:10px 14px;border-radius:9px;font-size:13px;box-shadow:0 4px 18px #0003}
-.cf-lane.cf-over {box-shadow:inset 0 0 0 2px #248974}
-.cf-card {user-select:none}
-.cf-event-person {padding-right:28px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.cf-head div {min-width:180px;white-space:normal}
-
+.cf-event-person {white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cf-empty {position:absolute;left:0;right:0;top:12px;text-align:center;color:#8aa29a;font-size:12px;pointer-events:none}
 """
 
 _GRID_JS = r"""
 export default function({parentElement,data,setStateValue}) {
   const root=parentElement.querySelector('#cf-calendar'); root.replaceChildren();
   const days=data.days||[], people=data.people||[], rows=data.rows||[];
-  const first=480,last=1260,step=30,px=84;
+  const weekMode=data.mode==='week';
+  const first=480,last=1260,step=30,px=weekMode?64:72;
   const minute=v=>{const p=(v||'').split(':').map(Number);return p.length===2&&p.every(Number.isFinite)?p[0]*60+p[1]:null};
   const clock=n=>String(Math.floor(n/60)).padStart(2,'0')+':'+String(n%60).padStart(2,'0');
   const el=(tag,cls,text)=>{const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=text;return n};
+  const WD=['日','一','二','三','四','五','六'];
+  const dayInfo=iso=>{const [y,m,d]=iso.split('-').map(Number);const w=new Date(y,m-1,d).getDay();return {md:m+'/'+d,wd:'週'+WD[w],weekend:w===0||w===6}};
+  const shortName=label=>{const p=String(label||'').split('｜');return (p[0].startsWith('姓名未對照')&&p[1])?p[1]:p[0]};
   const emit=(kind,payload)=>{
     status.textContent=kind==='select'?'正在開啟服務詳情…':'正在開啟改班確認視窗…';
     setStateValue('action',{kind,...payload,nonce:globalThis.crypto?.randomUUID?.()||String(Date.now())+Math.random()});
   };
-  const lanes=data.mode==='week'?days.map(d=>({id:data.person,day:d,label:d})):people.map(p=>({id:p.id,day:days[0],label:p.label}));
+  const lanes=weekMode?days.map(d=>({id:data.person,day:d,label:d})):people.map(p=>({id:p.id,day:days[0],label:p.label}));
   const status=el('div','cf-live','點卡片或「詳情」查看；按住右上角 ⠿ 移動。');status.setAttribute('aria-live','polite');root.appendChild(status);
-  const board=el('div','cf-workspace');
-  const columns='64px repeat('+lanes.length+', minmax(180px, 1fr))';
-  const head=el('div','cf-head');head.style.gridTemplateColumns=columns;head.appendChild(el('div','','時間'));
-  lanes.forEach(l=>head.appendChild(el('div','',l.label)));board.appendChild(head);
-  const body=el('div','cf-board');body.style.gridTemplateColumns=columns;body.style.height=((last-first)/step*px)+'px';
+  const board=el('div','cf-workspace'+(weekMode?' cf-week':''));board.style.setProperty('--px',px+'px');
+  const minLane=weekMode?96:150;
+  const columns='52px repeat('+lanes.length+', minmax('+minLane+'px, 1fr))';
+  const minWidth=(52+lanes.length*minLane)+'px';
+  const head=el('div','cf-head');head.style.gridTemplateColumns=columns;head.style.minWidth=minWidth;head.appendChild(el('div','','時間'));
+  lanes.forEach(l=>{
+    const cell=el('div','');
+    if(weekMode){
+      const info=dayInfo(l.day);if(info.weekend)cell.className='cf-wk';
+      if(data.today===l.day)cell.classList.add('cf-today');
+      cell.appendChild(el('span','cf-dn',info.wd));cell.appendChild(el('span','cf-dd',info.md));
+      const n=rows.filter(x=>x.date===l.day&&x.cg===l.id).length;
+      cell.appendChild(el('span','cf-cnt',n?n+' 筆服務':'休息／無班'));
+    } else {cell.textContent=l.label;cell.title=l.label}
+    head.appendChild(cell);
+  });
+  board.appendChild(head);
+  const body=el('div','cf-board');body.style.gridTemplateColumns=columns;body.style.minWidth=minWidth;body.style.height=((last-first)/step*px)+'px';
   const gutter=el('div');gutter.style.position='relative';
   for(let t=first;t<last;t+=60){const n=el('div','cf-time',clock(t));n.style.top=((t-first)/step*px)+'px';gutter.appendChild(n)}body.appendChild(gutter);
   const laneElements=[];let active=null,ghost=null;
@@ -108,22 +138,26 @@ export default function({parentElement,data,setStateValue}) {
   function targetAt(x,y){return laneElements.find(l=>{const r=l.node.getBoundingClientRect();return x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom})}
   function position(e){
     const target=targetAt(e.clientX,e.clientY);if(!target)return null;
-    const r=target.node.getBoundingClientRect();let start=first+Math.round(((e.clientY-r.top-active.offset)/px*step)/5)*5;
+    const r=target.node.getBoundingClientRect();const snap=Number(data.snap)||5;let start=first+Math.round(((e.clientY-r.top-active.offset)/px*step)/snap)*snap;
     if(Math.abs(e.clientY-active.y)<8)start=minute(active.row.start);
     const duration=minute(active.row.end)-minute(active.row.start);start=Math.max(first,Math.min(last-duration,start));
     return {target,start,end:start+duration};
   }
+  let earliest=null;
   for(const lane of lanes){
     const col=el('div','cf-lane');laneElements.push({node:col,...lane});
+    if(weekMode&&dayInfo(lane.day).weekend)col.classList.add('cf-wk');
     for(const row of rows.filter(x=>x.cg===lane.id&&x.date===lane.day)){
       const begin=minute(row.start),end=minute(row.end);if(begin===null||end===null||end<=first||begin>=last)continue;
+      if(earliest===null||begin<earliest)earliest=begin;
       const card=el('div','cf-card');card.dataset.tag=row.tag;card.tabIndex=0;card.setAttribute('role','button');
       card.style.top=(Math.max(0,(begin-first)/step*px)+2)+'px';card.style.height=Math.max(30,(Math.min(last,end)-Math.max(first,begin))/step*px-4)+'px';
       card.title=[row.client_label,row.start+'–'+row.end,row.code,row.tag,row.cg_label].join('｜');card.setAttribute('aria-label',card.title);
-      const title=el('strong','',row.client_label);card.appendChild(title);
-      card.appendChild(el('span','cf-event-time',row.start+'–'+row.end+' · '+(row.workflow_state||row.tag)));
+      const title=el('strong','',weekMode?shortName(row.client_label):row.client_label);card.appendChild(title);
+      const showTag=row.tag&&row.tag!=='單次'&&!(weekMode&&row.tag==='每週');
+      card.appendChild(el('span','cf-event-time',row.start+'–'+row.end+(showTag?' · '+row.tag:'')));
       card.appendChild(el('span','cf-event-code',row.code));
-      card.appendChild(el('span','cf-event-person',row.cg_label));
+      if(!weekMode)card.appendChild(el('span','cf-event-person',row.cg_label));
       const details=el('button','cf-details','詳情');details.type='button';details.onclick=e=>{e.stopPropagation();emit('select',{task_id:row.id})};card.appendChild(details);
       const handle=el('button','cf-handle','⠿');handle.type='button';handle.title='按住並移動：換人／改時間';handle.setAttribute('aria-label','拖曳調整班表');card.appendChild(handle);
       card.onclick=e=>{if(e.target!==handle)emit('select',{task_id:row.id})};
@@ -137,7 +171,8 @@ export default function({parentElement,data,setStateValue}) {
         if(!ghost){ghost=el('div','cf-drag-ghost');root.appendChild(ghost)}
         ghost.style.left=(e.clientX+14)+'px';ghost.style.top=(e.clientY+12)+'px';
         laneElements.forEach(l=>l.node.classList.remove('cf-over'));const p=position(e);
-        if(p){p.target.node.classList.add('cf-over');ghost.textContent=p.target.label+'\n'+clock(p.start)+'–'+clock(p.end);status.textContent='放開後預覽：'+p.target.label+' '+clock(p.start)+'–'+clock(p.end)}
+        const lab=weekMode?dayInfo(p?.target.day||lanes[0].day).md+' '+dayInfo(p?.target.day||lanes[0].day).wd:(p?.target.label||'');
+        if(p){p.target.node.classList.add('cf-over');ghost.textContent=lab+'\n'+clock(p.start)+'–'+clock(p.end);status.textContent='放開後預覽：'+lab+' '+clock(p.start)+'–'+clock(p.end)}
         else {ghost.textContent='請移到班表欄位內';status.textContent='移至班表內才可放開調整。'}
       };
       handle.onpointerup=e=>{
@@ -151,17 +186,52 @@ export default function({parentElement,data,setStateValue}) {
     }body.appendChild(col);
   }
   board.appendChild(body);root.appendChild(board);
+  // 開啟時自動捲到第一筆服務附近，免得一進來是空白的清晨欄位。
+  requestAnimationFrame(()=>{board.scrollTop=earliest===null?0:Math.max(0,(earliest-first)/step*px-px*0.6)});
   return ()=>clean();
 }
 """
 
 
-def _render_grid(rows, people, days, mode, person=""):
+def _digest(frame, columns=None):
+    """Vectorised content fingerprint (no per-row Python loop)."""
+    import hashlib
+    if frame is None or len(frame) == 0:
+        return "0"
+    part = frame if columns is None else frame[[c for c in columns if c in frame]]
+    return hashlib.sha256(pd.util.hash_pandas_object(part.astype(str), index=False).values.tobytes()
+                          + str(list(part.columns)).encode()).hexdigest()
+
+
+def cached_schedule_rows(result, tasks, caregivers, overrides=None, client_names=None, caregiver_names=None, workflow=None):
+    """build_schedule_rows，內容沒變就直接沿用（拖曳取消、開關視窗、切換日期都不重建）。"""
+    import hashlib
+    key = hashlib.sha256(repr((
+        _digest(result), _digest(tasks), _digest(caregivers, ["居服員ID"]),
+        sorted((str(k), repr(v)) for k, v in (overrides or {}).items()),
+        sorted((str(k), str(v)) for k, v in (client_names or {}).items()),
+        sorted((str(k), str(v)) for k, v in (caregiver_names or {}).items()),
+    )).encode()).hexdigest()
+    saved = st.session_state.get("_cf_rows_cache")
+    if saved and saved[0] == key:
+        return saved[1], saved[2]
+    rows, labels = build_schedule_rows(result, tasks, caregivers, overrides, client_names, caregiver_names)
+    st.session_state["_cf_rows_cache"] = (key, rows, labels)
+    return rows, labels
+
+
+def _render_grid(rows, people, days, mode, person="", snap=5):
     if not hasattr(st.components, "v2"):
         st.warning("請更新 Streamlit 至 1.52 以上，才能顯示互動班表。")
         return None
     component = st.components.v2.component("careflow_time_grid", html='<div id="cf-calendar"></div>', css=_GRID_CSS, js=_GRID_JS)
-    return component(data={"rows": rows, "people": people, "days": days, "mode": mode, "person": person},
+    # 只送目前畫面會用到的列（原本一次送整個月的全部服務，每次互動都重傳重畫）。
+    shown = {p["id"] for p in people}
+    if mode == "week":
+        visible = [r for r in rows if r["cg"] == person and r["date"] in days]
+    else:
+        visible = [r for r in rows if r["cg"] in shown and r["date"] in days]
+    return component(data={"rows": visible, "people": people, "days": days, "mode": mode, "person": person, "snap": snap, "today": date.today().isoformat()},
                      key="careflow_grid_v2", default={"action": None}, on_action_change=lambda: None)
 
 
@@ -239,7 +309,7 @@ def _assignment_dialog(row, labels, on_list_candidates, can_reassign, can_move=F
         return labels[cg] + (" · " + str(info.get("detail") or ("可派" if info.get("available") else "不符合條件")))
     choice = st.selectbox("指定居服員", choices, index=choices.index(row["cg"]) if row["cg"] in choices else None, placeholder="搜尋或選擇居服員", format_func=option_label, key="cf_dialog_cg_" + task_id)
     st.caption("可直接選人；按『確認安排』時仍會重新檢查是否可派。")
-    scope = st.radio("套用範圍", ["僅本次", "後續同週期服務"], horizontal=True, key="cf_dialog_scope_" + task_id)
+    scope = st.radio("套用範圍", ["僅本次"], horizontal=True, key="cf_dialog_scope_" + task_id)
     with st.expander("需要更改日期或開始時間？"):
         changed_date = st.date_input("新日期", value=pd.Timestamp(row['date']).date(), key='cf_edit_date_' + task_id)
         changed_time = st.time_input("新開始時間", value=datetime.strptime(row['start'], '%H:%M').time(), step=300, key='cf_edit_time_' + task_id)
@@ -281,7 +351,7 @@ def _move_dialog(original, draft, labels, can_move):
     st.write(f"新班：{draft['date']} {draft['start']}–{draft['end']} · {labels.get(draft['cg_id'], draft['cg_id'])}")
     if st.session_state.get('cf_dialog_error'):
         st.error(st.session_state['cf_dialog_error'])
-    scope = st.radio('套用範圍', ['僅本次', '後續同週期服務'], horizontal=True, key='cf_move_scope')
+    scope = st.radio('套用範圍', ['僅本次'], horizontal=True, key='cf_move_scope')
     reason = st.text_input('調整原因（必填）', key='cf_move_reason')
     c1,c2=st.columns(2)
     if c1.button('確認調整', type='primary', key='cf_confirm_move', disabled=not can_move):
@@ -300,12 +370,8 @@ def _move_dialog(original, draft, labels, can_move):
 def render_calendar_overview(result, tasks, caregivers, overrides=None, on_reassign=None,
                              on_list_candidates=None, on_move=None, client_names=None, caregiver_names=None, **kwargs):
     _process_assignment_request(on_reassign, on_move)
-    rows, labels = build_schedule_rows(result, tasks, caregivers, overrides, client_names, caregiver_names)
-    workflow = kwargs.get('workflow_store')
-    if workflow:
-        task_map = {str(t['任務ID']): t for _,t in tasks.iterrows()}
-        for row in rows:
-            row['workflow_state'] = workflow.record(task_map[row['id']],row['cg'],row['id'] in (overrides or {}))['state']
+    rows, labels = cached_schedule_rows(result, tasks, caregivers, overrides, client_names, caregiver_names,
+                                        kwargs.get('workflow_store'))
     st.markdown("### 班表工作台")
     if any(r["client_label"].startswith("姓名未對照｜") for r in rows) or any(v.startswith("姓名未對照｜") for v in labels.values()):
         st.info("部分姓名尚未顯示。請在『個資顯示設定』開啟姓名，並確認 Excel 的『案家姓名對照』與『居服員姓名對照』包含對應 ID。")
@@ -355,8 +421,14 @@ def render_calendar_overview(result, tasks, caregivers, overrides=None, on_reass
         else:
             st.success("這個月沒有待安排或已調整的服務。")
         return
-    left, right = st.columns([3.3, 1.1], gap="medium")
+    if mode == "全員日班":
+        left, right = st.columns([3.3, 1.1], gap="medium")
+    else:
+        # 個人週班：格線佔滿整個寬度（7 天一眼看完、不需左右捲動），待安排清單改放在下方。
+        left, right = st.container(), st.container()
     with left:
+        snap = st.segmented_control("拖曳時間單位", [5, 15, 30], default=5, format_func=lambda v: f"{v} 分鐘",
+                                    key="cf_snap", help="拖曳卡片時，開始時間每次移動的最小單位。") or 5
         if mode == "全員日班":
             selected_day = st.date_input("日期", value=pd.Timestamp(dates[0]).date(), key="cf_day")
             selected = st.multiselect("顯示居服員（最多 6 位）", list(labels), default=list(labels)[:5],
@@ -368,20 +440,37 @@ def render_calendar_overview(result, tasks, caregivers, overrides=None, on_reass
                 st.info("請選擇至少一位居服員。")
                 return
             people=[{"id":x,"label":labels[x]} for x in selected]
-            grid=_render_grid(rows,people,[selected_day.isoformat()],"day")
+            grid=_render_grid(rows,people,[selected_day.isoformat()],"day",snap=snap)
         else:
             active_people = {r['cg'] for r in rows if r['cg']}
             ordered_people = sorted(labels, key=lambda x: (x not in active_people, x))
             if not ordered_people:
                 st.info("目前没有可顯示的居服員。")
                 return
-            person = st.selectbox("居服員", ordered_people, format_func=lambda x: labels[x], key="cf_person")
             view_start = pd.Timestamp(kwargs.get('period_start') or dates[0]).date()
-            chosen = st.date_input("顯示起日（連續 7 天）",value=view_start,key="cf_week")
+            if 'cf_week' not in st.session_state:
+                st.session_state['cf_week'] = view_start
+            def _shift_week(days_delta):
+                current = st.session_state.get('cf_week') or view_start
+                st.session_state['cf_week'] = current + timedelta(days=days_delta)
+            def _reset_week():
+                st.session_state['cf_week'] = view_start
+            c_person, c_date, c_prev, c_next = st.columns([3.2, 2.2, 1, 1.15], vertical_alignment="bottom")
+            person = c_person.selectbox("居服員", ordered_people, format_func=lambda x: labels[x], key="cf_person")
+            chosen = c_date.date_input("起日（連續 7 天）", key="cf_week")
+            c_prev.button("‹ 上一週", key="cf_prev_week", on_click=_shift_week, args=(-7,), width="stretch",
+                          help="往前 7 天")
+            c_next.button("下一週 ›", key="cf_next_week", on_click=_shift_week, args=(7,), type="primary", width="stretch",
+                          help="往後 7 天")
             days=[(chosen+timedelta(days=i)).isoformat() for i in range(7)]
-            st.caption(f"查看 {days[0]} ～ {days[-1]}；切換居服員即可查看其他人的整週班表。")
-            grid=_render_grid(rows,[],days,"week",person)
-        st.caption("點卡片或「詳情」開啟視窗；按住卡片右上角 ⠿ 拖曳，放開後確認。可精確至 5 分鐘，原服務分鐘不變；也可在詳情內直接輸入日期和時間。")
+            first_day, last_day = chosen, chosen + timedelta(days=6)
+            n_week = sum(1 for r in rows if r['cg'] == person and r['date'] in days)
+            st.markdown(f"**{first_day.month}/{first_day.day}（{'一二三四五六日'[first_day.weekday()]}）"
+                        f" – {last_day.month}/{last_day.day}（{'一二三四五六日'[last_day.weekday()]}）**　"
+                        f"<span style='color:#667e76'>{labels.get(person, person)} · 本週 {n_week} 筆服務</span>",
+                        unsafe_allow_html=True)
+            grid=_render_grid(rows,[],days,"week",person,snap=snap)
+        st.caption("點卡片或「詳情」開啟視窗；按住卡片右上角 ⠿ 拖曳，放開後確認。可依上方「拖曳時間單位」（預設 5 分鐘）微調，原服務分鐘不變；也可在詳情內直接輸入日期和時間。")
     pending_clicked = False
     with left:
         visible_rows = [r for r in rows if r['date'] == selected_day.isoformat()] if mode == '全員日班' else [r for r in rows if r['date'] in days and r['cg'] == person]
