@@ -382,10 +382,11 @@ with st.sidebar:
 
     previous_week_bonus = 0.0
     continuity_bonus = defaults.preferred_caregiver_bonus
-    st.caption('優先排固定的歷史首選；首選排不進的服務才由同案備援承接。請假代班不改固定人選。')
+    st.caption('優先排固定的歷史首選；首選排不進的服務才由同案備援承接；主責＋備援都排不進的單次服務，再另選合格居服員臨時支援（不列入固定備援）。請假代班不改固定人選。')
     # 同案居服員安排固定採成功率最高的設定：主責＋最多 2 位備援；時段不自動挪動（要改時間請改 Excel）。
     enable_backup = True
     max_backups = 2
+    enable_support = True
     time_flex = 0
 
     with st.expander('派單進階設定', expanded=False):
@@ -452,6 +453,7 @@ config = PipelineConfig(
     previous_week_caregiver_bonus=previous_week_bonus,
     enable_backup_caregiver=enable_backup,
     max_backup_caregivers=int(max_backups),
+    enable_support_caregiver=enable_support,
     time_flex_minutes=float(time_flex),
 
     cert_bonus_dementia=skill_bonus,
@@ -997,6 +999,7 @@ else:
                 'agency_monthly_workflow': True, 'range_start': range_start, 'range_end': range_end,
                 'route_result': period_result['route_result'], 'client_primary_map': period_result['client_primary_map'],
                 'client_backup_map': dict(period_result.get('client_backup_map') or {}),
+                'task_support_map': dict(period_result.get('task_support_map') or {}),
                 '_seed_routes_available': True,
                 'extended_to_end': True,
             }
@@ -1013,6 +1016,8 @@ if "last_result" in st.session_state:
     config.client_primary_map = dict(res.get('client_primary_map', _workflow_store.primary_map()))
     # 備援名單必須跟著班表還原：每次畫面重跑 config 都是新的，少了這行，備援接手的服務會被當成「非固定人選」退回，成功率就憑空掉。
     config.client_backup_map = dict(res.get('client_backup_map') or (res.get('phase2') or {}).get('client_backup_map') or {})
+    # 臨時支援同理：只對該次服務有效，也要跟著班表還原。
+    config.task_support_map = dict(res.get('task_support_map') or (res.get('phase2') or {}).get('task_support_map') or {})
     config.primary_profiles = {str(r['居服員ID']):r.to_dict() for _,r in res['df_cg'].iterrows()}
     config.work_day_minutes = dict(res.get('work_day_minutes', {}))
 
@@ -1438,6 +1443,7 @@ if "last_result" in st.session_state:
                 _frame_digest(df_tasks[[c for c in ['任務ID', '案家ID', '日期', '時間窗_開始', '時間窗_結束'] if c in df_tasks]]),
                 sorted((str(k), str(v)) for k, v in config.client_primary_map.items()),
                 sorted((str(k), tuple(map(str, v))) for k, v in (getattr(config, 'client_backup_map', None) or {}).items()),
+                sorted((str(k), str(v)) for k, v in (getattr(config, 'task_support_map', None) or {}).items()),
                 _frame_digest(res['df_cg']), config.max_monthly_overtime_hours)).encode()).hexdigest())
             return _sig_memo[0]
 
@@ -1453,6 +1459,7 @@ if "last_result" in st.session_state:
             if not _bg_ctx:
                 _cfg = _dc.replace(config, client_primary_map=dict(config.client_primary_map),
                                    client_backup_map=dict(getattr(config, 'client_backup_map', None) or {}),
+                                   task_support_map=dict(getattr(config, 'task_support_map', None) or {}),
                                    work_day_minutes=dict(config.work_day_minutes), dispatch_cache={},
                                    primary_profiles=dict(getattr(config, 'primary_profiles', None) or {}))
                 _bg_ctx.append({'tasks': df_tasks.copy(), 'assignments': _operational_assignments.copy(), 'caregivers': res['df_cg'].copy(),

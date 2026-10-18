@@ -163,6 +163,33 @@ class BackupCaregiverTests(unittest.TestCase):
         config=e.PipelineConfig(client_primary_map={'CL_A':'CG_A'},client_backup_map={'CL_A':('CG_B',)})
         self.assertIsNone(primary_guard(task,{'居服員ID':'CG_B'},config))
         self.assertIn('固定居服員',primary_guard(task,{'居服員ID':'CG_C'},config))
+    def test_support_only_after_fixed_team_full(self):
+        # CL_A 的週日兩次服務：主責 CG_A 週日休息；CG_B、CG_C 各被自己的案家佔掉其中一個時段。
+        # 唯一備援（CG_B）只接得了 09:00，14:00 那次才由 CG_C 臨時支援，且 CG_C 不列入固定備援。
+        base={'性別':'女','交通工具':'機車','取得資格':'照顧服務員單一級技術士','長照服務人員到期日':'2030-01-01','到職日':'2020-01-01'}
+        self.g=pd.DataFrame([{**base,'編號':code,'休息日':rest,'經度 (WGS84_Lon)':121.50+i*.01,'緯度 (WGS84_Lat)':25.00+i*.01}
+                             for i,(code,rest) in enumerate([('CG_A','週日'),('CG_B','週六'),('CG_C','週五')])])
+        self.c=pd.DataFrame([{'內部案號':client,'歷史首選':owner,'經度 (WGS84_Lon)':121.505,'緯度 (WGS84_Lat)':25.005}
+                             for client,owner in [('CL_A','CG_A'),('CL_B','CG_B'),('CL_C','CG_C')]])
+        plan=lambda client,start,end:{'案號':client,'星期':'星期日','開始時間':start,'結束時間':end,'服務分鐘':60,'服務項目':'BA13(2)',
+                                      '頻率':'每週','生效日':'2026-09-28','經度 (WGS84_Lon)':121.505,'緯度 (WGS84_Lat)':25.005}
+        self.w=pd.DataFrame([plan('CL_A','09:00:00','10:00:00'),plan('CL_A','14:00:00','15:00:00'),
+                             plan('CL_B','14:00:00','15:00:00'),plan('CL_C','09:00:00','10:00:00')])
+        result,_=self.run_period(enable_backup_caregiver=True,max_backup_caregivers=1)
+        self.assertEqual(len(result['df_result']),3)              # 未開啟臨時支援：維持原行為
+        result,config=self.run_period(enable_backup_caregiver=True,max_backup_caregivers=1,enable_support_caregiver=True)
+        rows=result['df_result']
+        self.assertEqual(len(rows),4)
+        support=rows[rows['排班來源'].eq('臨時支援')]
+        self.assertEqual(len(support),1)
+        self.assertEqual(result['client_backup_map'],{'CL_A':('CG_B',)})
+        self.assertEqual(support.iloc[0]['派單居服員'],'CG_C')
+        self.assertEqual(support.iloc[0]['服務時段'],'14:00-15:00')
+        self.assertEqual(result['task_support_map'],{str(support.iloc[0]['任務ID']):'CG_C'})
+        from agency_rules import primary_guard
+        task={'案家ID':'CL_A','任務ID':support.iloc[0]['任務ID'],'日期':'2026-10-11','時間窗_開始':'14:00','時間窗_結束':'15:00'}
+        self.assertIsNone(primary_guard(task,{'居服員ID':'CG_C'},config))
+        self.assertIn('固定居服員',primary_guard({**task,'任務ID':'OTHER'},{'居服員ID':'CG_C'},config))
 
 
 class FlexibleDispatchTests(unittest.TestCase):
