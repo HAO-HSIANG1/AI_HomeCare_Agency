@@ -245,6 +245,10 @@ class PipelineConfig:
     backup_candidate_limit: int = 0         # 備援候選人數上限（依距離排序）；0＝檢查全部居服員（預設，成功率最高）
     rescue_missing_cert_with_backup: bool = False  # 缺必要證照／特殊訓練的服務是否由備援自動接手；預設否，需人工重新派單
     client_backup_map: dict = field(default_factory=dict, repr=False)  # 案家ID → (備援ID, ...)
+    # 臨時支援：主責＋固定備援（已滿 max_backup_caregivers）都排不進的單次服務，才另選合格居服員承接；
+    # 只記在該次服務上，不會變成該案的固定備援，原則仍是「1 位主責＋最多 N 位備援」。
+    enable_support_caregiver: bool = False
+    task_support_map: dict = field(default_factory=dict, repr=False)  # 任務ID → 臨時支援居服員ID
     client_primary_map: dict = field(default_factory=dict)
     primary_profiles: dict = field(default_factory=dict, repr=False)
     work_day_minutes: dict = field(default_factory=dict, repr=False)

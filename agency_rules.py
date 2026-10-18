@@ -69,6 +69,10 @@ def primary_guard(task, caregiver, config):
         backups = (backups,)
     if clean(caregiver.get('居服員ID')) in {clean(b) for b in backups}:
         return None
+    # 固定人選都排不進時，系統為「這一次服務」指定的臨時支援，不擴大為整案備援。
+    support = getattr(config, 'task_support_map', {}).get(clean(task.get('任務ID')))
+    if support and clean(caregiver.get('居服員ID')) == clean(support):
+        return None
     profile = config.primary_profiles.get(owner)
     if leave_overlap(task, profile):
         return None

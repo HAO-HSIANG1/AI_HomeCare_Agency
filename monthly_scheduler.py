@@ -108,6 +108,8 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
     config.client_primary_map,config.primary_profiles,config.work_day_minutes = owners,profiles,{}
     backups = {}
     config.client_backup_map = backups
+    supports = {}
+    config.task_support_map = supports
     days = {day:group.copy() for day,group in tasks.groupby('日期')}
     config.dispatch_cache = {'caregivers':caregivers,'people':profiles,'busy':_build_cg_busy_blocks(caregivers),
         'days':{id(frame):{'frame':frame,'ids':set(frame['任務ID']),
@@ -171,7 +173,8 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
         dates = (bool(joined and date<joined),bool(expiry and date>expiry),
                  date.isoformat() in excluded,leave_overlap(task,profile),blocked_reason(task,profile) or '')
         foreign = (owner,leave_overlap(task,profiles.get(owner)),
-                   worker in cfg.client_backup_map.get(str(task['案家ID']),())) if owner and owner!=worker else ()
+                   worker in cfg.client_backup_map.get(str(task['案家ID']),()),
+                   cfg.task_support_map.get(str(task['任務ID']))==worker) if owner and owner!=worker else ()
         key = pattern_of(task),worker,foreign,dates
         if key not in hard_results:
             hard_results[key] = _check_hard_constraints(pd.Series(task) if isinstance(task,dict) else task,profile_rows[worker],cfg)
@@ -702,6 +705,35 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
                     groups[(pattern_of(task_records[tid]),task_records[tid]['日期'])] = [task_records[tid]]
             groups_kind = {'pattern','single'}
             run_groups(groups)
+
+    # ---- 臨時支援：主責＋固定備援（含挪時段）都排不進的服務，逐次另選合格居服員 ----
+    # 只記在該次服務（task_support_map），不加入固定備援，所以每案固定人選仍是「1 主責＋最多 N 備援」。
+    # 同案已支援過的人優先，其次依距離；一樣要通過資格、請假、交通、工時與月加班檢查。
+    support_services = 0
+    if allow_backup and getattr(config,'enable_support_caregiver',False):
+        limit = int(getattr(config,'backup_candidate_limit',0)) or None
+        for client,tids in sorted(open_visits().items(),key=lambda kv:(-len(kv[1]),kv[0])):
+            owner = owners.get(client)
+            if not owner:
+                continue
+            team = {owner,*backups.get(client,())}
+            visits = sorted((task_records[t] for t in tids),key=lambda t:(t['日期'],t['時間窗_開始'],t['任務ID']))
+            site = visits[0].get('服務地點_緯度'),visits[0].get('服務地點_經度')
+            pool = [w for w in ranked_workers(client,owner,site,limit) if w not in team]
+            helpers = []
+            for task in visits:
+                tid = str(task['任務ID'])
+                for worker in helpers+[w for w in pool if w not in helpers]:
+                    supports[tid] = worker
+                    checked = check_visit(task,worker,assigned[task['日期']],config)
+                    if checked['available']:
+                        commit(task,worker,checked,source='臨時支援')
+                        rescued.add(task['任務ID'])
+                        support_services += 1
+                        if worker not in helpers:
+                            helpers.append(worker)
+                        break
+                    del supports[tid]
     diagnostics[:] = [d for d in diagnostics if d['任務ID'] not in rescued]
     if time_shifts:
         moved = {t['任務ID']:t for t in time_shifts}
@@ -722,14 +754,14 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
     if progress:
         progress(1.0,'全期間排班完成')
     return {'df_result':result,'df_matches':match_frame,'route_result':routes,
-        'client_primary_map':dict(owners),'client_backup_map':dict(backups),
+        'client_primary_map':dict(owners),'client_backup_map':dict(backups),'task_support_map':dict(supports),
         'time_shifts':pd.DataFrame(time_shifts),'tasks_adjusted':tasks,'status':pywraplp.Solver.FEASIBLE,'assigned_count':len(result),
         'df_valid':pd.DataFrame(),'pending_details':{d['任務ID']:d['逐人排班原因'] for d in diagnostics},
         'daily_counts':{day:len(frame) for day,frame in assigned.items()},'diagnostics':pd.DataFrame(diagnostics),
         '_day_templates':templates,
         'dispatch_stats':{'historical_clients':len(historical),'new_clients':total_new,'ownership_search_clients':total_new,
                           'copied_worker_days':copied_days,'checked_worker_days':checked_days,
-                          'backup_clients':len(backups),'backup_services':backup_services,
+                          'backup_clients':len(backups),'backup_services':backup_services,'support_services':support_services,
                           'time_shifted_services':len(time_shifts),'time_shift_fail_reasons':dict(shift_fail)}}
 
 
