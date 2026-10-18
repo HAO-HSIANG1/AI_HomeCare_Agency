@@ -355,7 +355,28 @@ with st.sidebar:
         st.session_state['_google_limit_default_version'] = 4
     with st.expander('交通進階設定',expanded=False):
         if provider in ('osrm','hybrid'):
-            st.text_input('OSRM 機車服務網址', value=os.getenv('CAREFLOW_OSRM_MOTORCYCLE_HOST','http://127.0.0.1:5001'), key='CAREFLOW_OSRM_MOTORCYCLE_HOST')
+            from osrm_client import is_remote as _osrm_is_remote
+            _local_osrm = 'http://127.0.0.1:5001'
+            _cloud_osrm = 'https://careflow-osrm-motorcycle.onrender.com'
+            _configured = os.getenv('CAREFLOW_OSRM_MOTORCYCLE_HOST')
+            if not _configured:
+                try:
+                    _configured = st.secrets.get('CAREFLOW_OSRM_MOTORCYCLE_HOST')
+                except Exception:
+                    _configured = None
+            _configured_remote = bool(_configured) and _osrm_is_remote(str(_configured))
+            _configured_local = bool(_configured) and not _configured_remote
+            if _configured_remote:
+                _cloud_osrm = str(_configured).rstrip('/')
+            _osrm_choices = {'本機 Docker': _local_osrm, '雲端 Render': _cloud_osrm}
+            _osrm_pick = st.radio('機車路網', list(_osrm_choices), index=0 if _configured_local else 1,
+                                  horizontal=True, key='osrm_source_choice',
+                                  help='預設雲端 Render。機構內部正式使用時，可用 Docker 自架機車路網（見 osrm_motorcycle 資料夾），案家座標不會傳到外部。')
+            if _osrm_pick == '本機 Docker' and not _configured_local:
+                st.warning('本機 Docker 需要在自己電腦自架機車路網（安裝 Docker 後執行 osrm_motorcycle 資料夾內的腳本）。'
+                           '雲端版或尚未架設時請選「雲端 Render」，否則交通時間會算不出來。')
+            st.session_state['CAREFLOW_OSRM_MOTORCYCLE_HOST'] = _osrm_choices[_osrm_pick]
+            st.caption(f"機車路網連線：{_osrm_choices[_osrm_pick]}（{'外部主機' if _osrm_is_remote(_osrm_choices[_osrm_pick]) else '本機'}）")
         if provider in ('google','hybrid'):
             google_query_limit = st.number_input('每次排班 Google Transit elements 安全上限',min_value=100,max_value=100000,step=500,key='google_query_limit',help='Google ComputeRouteMatrix 依 origins × destinations 計算 elements。系統會批次查詢並快取；這是安全上限，不代表一定會用到這麼多。')
 
