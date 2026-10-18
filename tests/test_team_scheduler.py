@@ -282,3 +282,32 @@ def test_saved_team_scoped_separately_from_primary(tmp_path):
     assert WorkflowStore('agency',path).series_map()=={'mon':'A','wed':'B'}
     assert WorkflowStore('agency',path).primary_map()=={'C':'A'}
     assert WorkflowStore('other',path).series_map()=={}
+
+
+def test_ai_dispatch_never_assigns_a_7th_consecutive_day_but_resumes_after_the_gap():
+    """AI 排班一律不得連續上班超過 6 天：第 7 天硬性擋下、不指派任何人；
+    擋下的那天沒有上班，連續天數就重新起算，第 8 天可以再排。"""
+    dates = pd.date_range('2026-11-02',periods=8,freq='D').strftime('%Y-%m-%d').tolist()
+    visits = pd.DataFrame([task(f't{i}',day=day) for i,day in enumerate(dates)])
+    people = pd.DataFrame([worker(),worker('B')])
+    result = run_fixed_period_dispatch(visits,people,clients('C',歷史首選='A'),cfg())
+    assigned = result['df_result'].set_index('任務ID')
+    for i in [0,1,2,3,4,5,7]:
+        assert assigned.loc[f't{i}','派單居服員']=='A'
+    assert 't6' not in assigned.index
+    blocked = result['diagnostics']
+    row = blocked[blocked['任務ID']=='t6']
+    assert not row.empty and row.iloc[0]['問題分類']=='連續工作天數'
+
+
+def test_consecutive_workdays_seed_carries_over_the_month_boundary():
+    """跨月：居服員在本期間開始前（由 WorkflowStore 歷史種子帶入）已連續上班到門檻邊緣，
+    本期間第一天就要被視為第7天而擋下，不能因為換了月份重新從零起算。"""
+    visits = pd.DataFrame([task('t0',day='2026-12-01')])
+    people = pd.DataFrame([worker(),worker('B')])
+    seed = {'A':{f'2026-11-{d:02}' for d in range(25,31)}}  # 11/25～11/30 共6天連續上班
+    result = run_fixed_period_dispatch(visits,people,clients('C',歷史首選='A'),cfg(),worker_workday_seed=seed)
+    assert 't0' not in set(result['df_result'].get('任務ID',[]))
+    row = result['diagnostics']
+    row = row[row['任務ID']=='t0']
+    assert not row.empty and row.iloc[0]['問題分類']=='連續工作天數'
