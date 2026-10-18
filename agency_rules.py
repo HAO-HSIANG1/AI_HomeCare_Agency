@@ -117,6 +117,42 @@ def monthly_overtime_error(cg_id, day, working_minutes, config, caregiver=None):
     return None
 
 
+def consecutive_run_before(workdays, day):
+    """回傳 day（'YYYY-MM-DD'）之前、不中斷的已上班天數。workdays 為該居服員已知上班日期字串集合
+    （跨月持久種子＋本次已排），day 當天本身不計入。"""
+    day = pd.to_datetime(day, errors='coerce')
+    if pd.isna(day):
+        return 0
+    cursor = day - pd.Timedelta(days=1)
+    streak = 0
+    while cursor.strftime('%Y-%m-%d') in workdays:
+        streak += 1
+        cursor -= pd.Timedelta(days=1)
+    return streak
+
+
+def consecutive_workdays_error(worker, day, config):
+    """連續上班天數規則：若排入 day 會讓居服員連續上班達 config.max_consecutive_work_days+1 天，
+    回傳說明文字；否則回傳 None。
+
+    呼叫端決定如何處理非 None 的回傳值：AI 批次排班（monthly_scheduler.check_visit）視為硬性
+    擋下，一律不指派；人工插單／人工改派只拿它顯示提醒，不阻擋操作——規則判斷邏輯只有這一處，
+    兩邊共用，訊息文案與門檻值不會跑掉。
+
+    config.worker_workdays：{居服員ID: {日期字串,...}}，由呼叫端維護並持續寫入（本函式不修改）。
+    """
+    limit = int(getattr(config, 'max_consecutive_work_days', 6))
+    workdays = getattr(config, 'worker_workdays', {}).get(str(worker), set())
+    streak = consecutive_run_before(workdays, day)
+    if streak < limit:
+        return None
+    day_ts = pd.to_datetime(day, errors='coerce')
+    first = (day_ts - pd.Timedelta(days=streak)).strftime('%Y-%m-%d')
+    last = (day_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    return (f'已連續上班 {streak} 天（{first}～{last}），若 {day_ts.strftime("%Y-%m-%d")} 再排班，'
+            f'將達連續 {streak + 1} 天，超過上限 {limit} 天，不得連續上班逾 {limit} 天。')
+
+
 def payroll_tables(tasks, assignments, caregivers, routes, config):
     """Rebuild money from effective assignments and current signed route legs.
 
