@@ -2351,40 +2351,118 @@ if "last_result" in st.session_state:
 
         st.session_state['_workflow_cg_labels'] = {str(x):caregiver_label(str(x)) for x in res['df_cg']['居服員ID']}
         st.session_state['_workflow_cl_labels'] = {str(k):str(v)+'｜'+str(k) for k,v in (_client_names if _show_names else {}).items()}
-        def _auto_cover_leave(cg_id, limit=40):
-            """請假登錄後，為該居服員被擋下的服務自動找代班：優先該案已指定的備援，再依空檔排序；通過同一套衝突檢查才套用。"""
+        def _leave_owned_tasks(cg_id):
+            """原本屬於這位居服員的服務：AI 結果排給他的，加上排班時就因他請假而由別人代班的（固定居服員是他）。"""
             cg_id = str(cg_id)
-            todo = [tid for tid, ov in list(overrides.items())
-                    if ov.get('cg_id') is None and str(assigned_map.get(tid, '')) == cg_id][:limit]
+            owned = {str(t) for t, c in assigned_map.items() if str(c) == cg_id}
+            if {'固定居服員ID', '是否請假代班'} <= set(df_result.columns):
+                flagged = df_result[(df_result['固定居服員ID'].astype(str) == cg_id)
+                                    & df_result['是否請假代班'].astype(str).str.lower().isin(['true', '1', '是'])]
+                owned |= set(flagged['任務ID'].astype(str))
+            return owned
+
+        def _leave_current_map():
+            """目前實際派單（含所有人工改派）；沒有人服務的回傳 None。"""
+            _, effective = _workflow_frames()
+            current = {}
+            for tid, cg in zip(effective.get('任務ID', []), effective.get('派單居服員', [])):
+                text = '' if cg is None or (isinstance(cg, float) and pd.isna(cg)) else str(cg)
+                current[str(tid)] = None if text in ('', '未指派', 'None', 'nan') else text
+            return current
+
+        def _auto_cover_leave(cg_id, day=None, limit=60):
+            """請假登錄後，逐筆檢查該居服員當天原排的服務：沒人服務的自動找代班（優先該案備援，再依空檔排序，
+            通過同一套衝突檢查才套用）；已有人服務的列出由誰代班。回傳 (已代班數, 需代班數, 明細)。"""
+            cg_id = str(cg_id)
+            tasks_all, _ = _workflow_frames()
+            ids_all = tasks_all['任務ID'].astype(str)
+            dates = dict(zip(ids_all, pd.to_datetime(tasks_all['日期'], errors='coerce').dt.strftime('%Y-%m-%d')))
+            starts = dict(zip(ids_all, tasks_all['時間窗_開始'].astype(str))) if '時間窗_開始' in tasks_all else {}
+            mine = [t for t in _leave_owned_tasks(cg_id) if day is None or dates.get(t) == str(day)[:10]]
+            mine = sorted(mine, key=lambda t: (dates.get(t) or '', starts.get(t, '')))[:limit]
             base_ids = [str(x) for x in res['df_cg']['居服員ID'] if str(x) != cg_id]
-            covered = 0
-            for tid in todo:
+            covered, need, report = 0, 0, []
+            for tid in mine:
+                current = _leave_current_map().get(tid)
+                if current == cg_id:
+                    continue          # 不在請假時段內，仍由本人服務
                 tasks_now, effective_now = _workflow_frames()
-                row = tasks_now[tasks_now['任務ID'].astype(str) == str(tid)]
+                row = tasks_now[tasks_now['任務ID'].astype(str) == tid]
                 client = str(row.iloc[0]['案家ID']) if not row.empty else ''
+                info = row.iloc[0] if not row.empty else {}
+                entry = {'任務ID': tid, '日期': dates.get(tid) or '',
+                         '時段': f"{info.get('時間窗_開始', '')}–{info.get('時間窗_結束', '')}" if len(row) else '',
+                         '案家': client_label(client), '原居服員': caregiver_label(cg_id)}
+                if current is not None:
+                    report.append({**entry, '代班居服員': caregiver_label(current), '結果': '已由代班服務'})
+                    continue
+                need += 1
                 team = [str(x) for x in (config.client_backup_map.get(client) or ())]
                 ids = [x for x in team if x in base_ids] + [x for x in base_ids if x not in team]
                 try:
                     ranked = rank_candidates_by_availability(tid, ids, tasks_now, effective_now, res['df_cg'], config,
                                                              date_column='日期', df_cl=res.get('df_cl'))
-                except Exception:
+                except Exception as exc:
+                    report.append({**entry, '代班居服員': '—', '結果': f'候選計算失敗：{exc}'})
                     continue
                 pick = next((r['cg_id'] for r in ranked if r.get('available')), None)
-                if pick is not None and _quick_reassign(tid, str(pick), '請假代班（系統自動建議）', apply_scope='僅本次') is None:
+                msg = (_quick_reassign(tid, str(pick), '請假代班（系統自動建議）', apply_scope='僅本次')
+                       if pick is not None else '找不到可派人選，請到「人工調整班表」處理')
+                if msg is None:
                     covered += 1
-            return covered, len(todo)
+                report.append({**entry, '代班居服員': caregiver_label(str(pick)) if msg is None else '—',
+                               '結果': '本次自動代班' if msg is None else msg})
+            return covered, need, report
 
         _cover_cg = st.session_state.pop('auto_cover_cg', None)
+        _cover_day = st.session_state.pop('auto_cover_day', None)
         if _cover_cg:
             with st.spinner('正在為受影響的服務尋找代班人選…'):
-                _covered, _affected_total = _auto_cover_leave(_cover_cg)
+                _covered, _need, _cover_rows = _auto_cover_leave(_cover_cg, _cover_day)
+            st.session_state['leave_cover_report'] = {'cg': caregiver_label(str(_cover_cg)), 'day': _cover_day or '', 'rows': _cover_rows}
+            _earlier = len(_cover_rows) - _need
             st.session_state['workflow_notice'] = (
-                f'{caregiver_label(str(_cover_cg))} 的請假已登錄：{_affected_total} 筆受影響服務中，'
-                f'已自動找到代班 {_covered} 筆' + (f'，另有 {_affected_total - _covered} 筆找不到可派人選，請到「人工調整班表」處理。' if _affected_total > _covered else '。'))
+                f'{caregiver_label(str(_cover_cg))} {_cover_day or ""} 的請假已登錄：原排 {len(_cover_rows)} 筆服務，'
+                f'本次需代班 {_need} 筆、已自動找到 {_covered} 筆'
+                + (f'；{_earlier} 筆已由代班服務' if _earlier else '')
+                + (f'；{_need - _covered} 筆找不到可派人選，請到「人工調整班表」處理' if _need > _covered else '')
+                + '。明細見下方表格。')
+        _restore = st.session_state.pop('restore_after_revoke', None)
+        if _restore:
+            from dispatch_workflow import overlap as _wf_overlap
+            _r_cg = str(_restore['cg'])
+            _r_tasks, _ = _workflow_frames()
+            _r_rows, _restored = [], 0
+            _r_tasks = _r_tasks.sort_values([c for c in ('日期', '時間窗_開始') if c in _r_tasks.columns])
+            _r_owned, _r_now_map = _leave_owned_tasks(_r_cg), _leave_current_map()
+            for _, _t in _r_tasks.iterrows():
+                _tid = str(_t['任務ID'])
+                if _tid not in _r_owned or not _wf_overlap(_t, _restore):
+                    continue
+                _now = _r_now_map.get(_tid)
+                if _now == _r_cg:
+                    continue          # 已經是原居服員
+                _entry = {'任務ID': _tid, '日期': str(_t.get('日期', ''))[:10],
+                          '時段': f"{_t.get('時間窗_開始', '')}–{_t.get('時間窗_結束', '')}",
+                          '案家': client_label(str(_t.get('案家ID', ''))),
+                          '代班居服員': caregiver_label(str(_now)) if _now else '待安排'}
+                _msg = _quick_reassign(_tid, _r_cg, '撤銷請假，還給原居服員')
+                if _msg is None:
+                    _restored += 1
+                _r_rows.append({**_entry, '目前居服員': caregiver_label(_r_cg) if _msg is None else _entry['代班居服員'],
+                                '結果': '已還給原居服員' if _msg is None else f'未還原：{_msg}'})
+            st.session_state['leave_cover_report'] = {
+                'title': '撤銷請假還原結果', 'cg': caregiver_label(_r_cg), 'day': str(_restore['start'])[:10], 'rows': _r_rows,
+                'empty': '這段時間沒有代班中的服務，不需要還原。'}
+            st.session_state['workflow_notice'] = (
+                f'已撤銷 {caregiver_label(_r_cg)} {str(_restore["start"])[:10]} 的不可排時段：'
+                f'{len(_r_rows)} 筆代班服務中，{_restored} 筆已還給原居服員'
+                + (f'；{len(_r_rows) - _restored} 筆因衝突保留代班' if len(_r_rows) > _restored else '')
+                + '。明細見下方表格。')
         if st.session_state.get('workflow_notice'):
             st.success(st.session_state.pop('workflow_notice'))
 
-        def _task_picker(prefix, tasks, assigned=None):
+        def _task_picker(prefix, tasks, assigned=None, keep_unassigned=False):
             """案家 → 日期 → 服務，逐層縮小範圍；不必在上千筆任務的單一下拉選單裡找。回傳任務ID，沒有可選時回傳 None。"""
             if tasks is None or tasks.empty or '任務ID' not in tasks.columns:
                 return None
@@ -2393,7 +2471,8 @@ if "last_result" in st.session_state:
             frame['任務ID'] = frame['任務ID'].astype(str)
             if assigned is not None:
                 frame['居服員'] = frame['任務ID'].map(assigned)
-                frame = frame[frame['居服員'].notna() & (frame['居服員'].astype(str) != '未指派')]
+                if not keep_unassigned:
+                    frame = frame[frame['居服員'].notna() & (frame['居服員'].astype(str) != '未指派')]
             if frame.empty:
                 return None
             frame['_day'] = pd.to_datetime(frame.get('日期'), errors='coerce').dt.strftime('%Y-%m-%d').fillna('未定')
@@ -2406,8 +2485,10 @@ if "last_result" in st.session_state:
             labels = {}
             for row in picked.to_dict('records'):
                 text = f"{row.get('時間窗_開始', '')}–{row.get('時間窗_結束', '')}"
-                if row.get('居服員') is not None:
+                if row.get('居服員') is not None and pd.notna(row.get('居服員')) and str(row['居服員']) not in ('', '未指派', 'None'):
                     text += f"｜{caregiver_label(str(row['居服員']))}"
+                elif assigned is not None:
+                    text += "｜未指派"
                 labels[row['任務ID']] = text
             return right.selectbox('服務', list(labels), format_func=labels.get, key=f'{prefix}_pick_task_{client}_{day}')
 
@@ -2742,6 +2823,16 @@ if "last_result" in st.session_state:
 
         elif _dynamic_event_type == "🚨 居服員臨時請假":
             _wf_tasks, _wf_result = _workflow_frames()
+            _leave_report = st.session_state.get('leave_cover_report')
+            if _leave_report:
+                st.markdown(f"**{_leave_report.get('title', '最近一次請假代班結果')}｜{_leave_report['cg']} {_leave_report.get('day', '')}**")
+                if _leave_report.get('rows'):
+                    show_table(pd.DataFrame(_leave_report['rows']), width='stretch', hide_index=True)
+                else:
+                    st.info(_leave_report.get('empty', '這位居服員在請假日期沒有原排的服務，不需要代班。'))
+                if st.button('關閉代班結果', key='leave_cover_report_close'):
+                    st.session_state.pop('leave_cover_report', None)
+                    st.rerun()
             render_leave(_workflow_store, res['df_cg'], _wf_tasks, _wf_result, overrides)
 
         elif _dynamic_event_type == "🕒 案家臨時改期":
@@ -2758,7 +2849,15 @@ if "last_result" in st.session_state:
 
             _effective_result_for_reschedule = apply_overrides_to_result(df_result, overrides)
 
-            _reschedule_task_id = _task_picker('reschedule', df_tasks)
+            _resched_assigned = None
+            if not _effective_result_for_reschedule.empty:
+                _resched_unique = _effective_result_for_reschedule.drop_duplicates('任務ID')
+                _resched_assigned = pd.Series(_resched_unique['派單居服員'].values, index=_resched_unique['任務ID'].astype(str).values)
+            _reschedule_task_id = _task_picker('reschedule', df_tasks, assigned=_resched_assigned, keep_unassigned=True)
+            _resched_orig_cg = ''
+            if _reschedule_task_id is not None and _resched_assigned is not None:
+                _resched_orig_cg = _resched_assigned.get(str(_reschedule_task_id))
+                _resched_orig_cg = '' if _resched_orig_cg is None or pd.isna(_resched_orig_cg) or str(_resched_orig_cg) in ('未指派', 'None') else str(_resched_orig_cg)
             if _reschedule_task_id is None:
                 st.info("目前沒有可供改期的既有任務。")
             else:
@@ -2812,7 +2911,15 @@ if "last_result" in st.session_state:
                         f"原排程：{_orig_date.strftime('%Y-%m-%d')} "
                         f"{_orig_task.get('時間窗_開始', '')}-"
                         f"{_orig_task.get('時間窗_結束', '')}"
+                        + (f"｜原居服員 {caregiver_label(_resched_orig_cg)}" if _resched_orig_cg else "｜目前未指派")
                     )
+
+                    def _date_cell(frame, day):
+                        """依欄位型別寫入日期：pandas 3 的字串欄位不接受 Timestamp，會丟 TypeError。"""
+                        day = pd.Timestamp(day)
+                        if "日期" in frame.columns and pd.api.types.is_datetime64_any_dtype(frame["日期"]):
+                            return day
+                        return day.strftime("%Y-%m-%d")
 
                     if st.button(
                         "🔎 暫時移除原任務並重新找候選人",
@@ -2824,7 +2931,7 @@ if "last_result" in st.session_state:
                         else:
                             try:
                                 _new_task = _orig_task.copy()
-                                _new_task["日期"] = pd.Timestamp(_new_date)
+                                _new_task["日期"] = _date_cell(df_tasks, _new_date)
                                 _new_task["時間窗_開始"] = _new_start.strftime("%H:%M")
                                 _new_task["時間窗_結束"] = _new_end.strftime("%H:%M")
 
@@ -2841,7 +2948,7 @@ if "last_result" in st.session_state:
                                     == str(_reschedule_task_id)
                                 )
                                 if "日期" in _tasks_changed.columns:
-                                    _tasks_changed.loc[_mask, "日期"] = pd.Timestamp(_new_date)
+                                    _tasks_changed.loc[_mask, "日期"] = _date_cell(_tasks_changed, _new_date)
                                 if "時間窗_開始" in _tasks_changed.columns:
                                     _tasks_changed.loc[_mask, "時間窗_開始"] = _new_start.strftime("%H:%M")
                                 if "時間窗_結束" in _tasks_changed.columns:
@@ -2905,6 +3012,8 @@ if "last_result" in st.session_state:
                                 )
                             else:
                                 _top3 = _available.head(3).copy()
+                                if _resched_orig_cg:
+                                    _top3.insert(2, "原居服員", _top3["居服員ID"].astype(str).eq(_resched_orig_cg).map({True: "✓", False: ""}))
                                 st.success(
                                     f"新時段找到 {len(_top3)} 位可直接插入候選人。"
                                 )
@@ -2931,6 +3040,8 @@ if "last_result" in st.session_state:
 
                                     _left, _right = st.columns([4, 1])
                                     _label = f"候選 {_rank}｜{caregiver_label(_new_cg)}"
+                                    if _resched_orig_cg and _new_cg == _resched_orig_cg:
+                                        _label += "｜⭐ 原居服員"
                                     if pd.notna(_score):
                                         _label += f"｜適配分數 {float(_score):.1f}"
                                     _label += f"｜擾動成本 {_cost}"
@@ -2954,6 +3065,18 @@ if "last_result" in st.session_state:
                                             f"{_new_task_info.get('時間窗_結束')}"
                                         )
 
+                                        # 先把任務換成新日期／時段，再做衝突檢查；否則會拿「舊時段」去檢查。
+                                        _main_tasks = st.session_state["last_result"]["df_tasks"]
+                                        _main_mask = _main_tasks["任務ID"].astype(str) == str(_reschedule_task_id)
+                                        _cols = [c for c in ("日期", "時間窗_開始", "時間窗_結束") if c in _main_tasks.columns]
+                                        _backup = _main_tasks.loc[_main_mask, _cols].copy()
+                                        if "日期" in _cols:
+                                            _main_tasks.loc[_main_mask, "日期"] = _date_cell(_main_tasks, _new_task_info.get("日期"))
+                                        if "時間窗_開始" in _cols:
+                                            _main_tasks.loc[_main_mask, "時間窗_開始"] = _new_task_info.get("時間窗_開始")
+                                        if "時間窗_結束" in _cols:
+                                            _main_tasks.loc[_main_mask, "時間窗_結束"] = _new_task_info.get("時間窗_結束")
+
                                         _conflict_msg = _quick_reassign(
                                             _reschedule_task_id,
                                             _new_cg,
@@ -2961,27 +3084,9 @@ if "last_result" in st.session_state:
                                         )
 
                                         if _conflict_msg:
+                                            _main_tasks.loc[_main_mask, _cols] = _backup.values   # 檢查失敗就還原原時段
                                             st.error(_conflict_msg)
                                         else:
-                                            # 真正更新目前 session 中的任務日期／時間
-                                            _main_mask = (
-                                                st.session_state["last_result"]["df_tasks"]["任務ID"]
-                                                .astype(str)
-                                                == str(_reschedule_task_id)
-                                            )
-                                            if "日期" in st.session_state["last_result"]["df_tasks"].columns:
-                                                st.session_state["last_result"]["df_tasks"].loc[
-                                                    _main_mask, "日期"
-                                                ] = pd.Timestamp(_new_task_info.get("日期"))
-                                            if "時間窗_開始" in st.session_state["last_result"]["df_tasks"].columns:
-                                                st.session_state["last_result"]["df_tasks"].loc[
-                                                    _main_mask, "時間窗_開始"
-                                                ] = _new_task_info.get("時間窗_開始")
-                                            if "時間窗_結束" in st.session_state["last_result"]["df_tasks"].columns:
-                                                st.session_state["last_result"]["df_tasks"].loc[
-                                                    _main_mask, "時間窗_結束"
-                                                ] = _new_task_info.get("時間窗_結束")
-
                                             _confirmed_at = pd.Timestamp.now()
                                             _top3_ids = " > ".join(
                                                 _top3["居服員ID"].astype(str).tolist()
@@ -3191,6 +3296,29 @@ if "last_result" in st.session_state:
                         _candidate_cg["居服員ID"].astype(str) != _cg_id
                     ].copy()
 
+                def _delay_cfg_for(_a):
+                    """延遲當次視同原固定居服員趕不上這一案（這段時間請假），只在這次計算開放代班，不改動正式設定。"""
+                    import json as _json
+                    from dataclasses import replace as _replace
+                    _row = _a["row"]
+                    _client = str(_row.get("案家ID", ""))
+                    _owner = config.client_primary_map.get(_client) or _row.get("歷史首選居服員ID")
+                    _owner = _cg_id if _owner is None or pd.isna(_owner) or not str(_owner).strip() else str(_owner)
+                    _cfg = _replace(config, primary_profiles=dict(config.primary_profiles))
+                    _prof = dict(_cfg.primary_profiles.get(_owner) or {})
+                    _raw = _prof.get("臨時不可排時段") or "[]"
+                    try:
+                        _blocks = _json.loads(_raw) if isinstance(_raw, str) else list(_raw)
+                    except ValueError:
+                        _blocks = []
+                    _day = pd.to_datetime(_row.get("日期")).strftime("%Y-%m-%d")
+                    _blocks.append({"start": f"{_day}T{str(_row.get('時間窗_開始'))[:5]}:00",
+                                    "end": f"{_day}T{str(_row.get('時間窗_結束'))[:5]}:00",
+                                    "reason": "請假（前一服務延遲）"})
+                    _prof["臨時不可排時段"] = _json.dumps(_blocks, ensure_ascii=False)
+                    _cfg.primary_profiles[_owner] = _prof
+                    return _cfg
+
                 for _a in _affected:
                     try:
                         _cand = find_insertion_candidates(
@@ -3198,7 +3326,7 @@ if "last_result" in st.session_state:
                             _tasks_merged,
                             _base_result,
                             _candidate_cg,
-                            config,
+                            _delay_cfg_for(_a),
                             top_n=3,
                             date_column="日期",
                         )
@@ -3219,7 +3347,16 @@ if "last_result" in st.session_state:
             if not _effective_result_for_delay.empty:
                 _delay_unique = _effective_result_for_delay.drop_duplicates('任務ID')
                 _delay_assigned = pd.Series(_delay_unique['派單居服員'].values, index=_delay_unique['任務ID'].astype(str).values)
-            _delay_task_id = _task_picker('delay', df_tasks, assigned=_delay_assigned) if _delay_assigned is not None else None
+            _delay_tasks_view, _delay_who = df_tasks, '全部'
+            if _delay_assigned is not None:
+                _delay_people = sorted({str(v) for v in _delay_assigned.dropna()} - {'', '未指派', 'None', 'nan'})
+                _delay_who = st.selectbox('居服員（可先選人，再挑案家與服務）', ['全部'] + _delay_people,
+                                          format_func=lambda v: '全部居服員' if v == '全部' else caregiver_label(v),
+                                          key='delay_pick_cg')
+                if _delay_who != '全部':
+                    _delay_ids = set(_delay_assigned[_delay_assigned.astype(str) == _delay_who].index)
+                    _delay_tasks_view = df_tasks[df_tasks['任務ID'].astype(str).isin(_delay_ids)]
+            _delay_task_id = _task_picker(f'delay_{_delay_who}', _delay_tasks_view, assigned=_delay_assigned) if _delay_assigned is not None else None
             if _delay_task_id is None:
                 st.info("目前沒有可分析的已派任務。")
             else:
@@ -3443,11 +3580,27 @@ if "last_result" in st.session_state:
                                                 f"{_task_id} 無法維持原銜接"
                                             )
 
+                                            # 原居服員趕不上這一案：登錄只涵蓋這一案時段的「請假（前一服務延遲）」，
+                                            # 才能依規定開放代班，且重新整理後改派不會被退回。
+                                            _d_row = _a["row"]
+                                            _d_day = pd.to_datetime(_d_row.get("日期")).strftime("%Y-%m-%d")
+                                            _d_span = (str(_d_row.get("時間窗_開始"))[:5], str(_d_row.get("時間窗_結束"))[:5])
+                                            _d_cg = str(_a.get("original_cg") or _delay_ctx["cg_id"])
+                                            _d_before = {b["id"] for b in _workflow_store.blocks()}
+                                            _workflow_store.add_blocks(_d_cg, _d_day, [_d_span], "請假（前一服務延遲）")
+                                            res["df_cg"] = attach_blocks(res["df_cg"], _workflow_store)
+                                            config.primary_profiles = {str(r["居服員ID"]): r.to_dict() for _, r in res["df_cg"].iterrows()}
                                             _conflict_msg = _quick_reassign(
                                                 _task_id,
                                                 _new_cg,
                                                 _reason,
                                             )
+                                            if _conflict_msg:
+                                                for _b in _workflow_store.blocks():
+                                                    if _b["id"] not in _d_before:
+                                                        _workflow_store.remove_block(_b["id"])
+                                                res["df_cg"] = attach_blocks(res["df_cg"], _workflow_store)
+                                                config.primary_profiles = {str(r["居服員ID"]): r.to_dict() for _, r in res["df_cg"].iterrows()}
 
                                             if _conflict_msg:
                                                 st.error(_conflict_msg)

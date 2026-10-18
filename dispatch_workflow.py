@@ -161,7 +161,8 @@ def render_leave(store, caregivers, tasks, result, overrides):
             assignment=dict(zip(result.get('任務ID',[]),result.get('派單居服員',[])))
             affected=sum(1 for _,t in tasks.iterrows() if str(assignment.get(t['任務ID'],''))==str(cg) and any(b['cg']==str(cg) and overlap(t,b) for b in store.blocks()))
             st.session_state['workflow_notice']=f'已登錄不可排時間，本次有 {affected} 筆已派服務受影響，已標為待安排，請到「人工調整班表」改派。'
-            if reason=='請假' and affected:
+            if reason=='請假':
+                st.session_state['auto_cover_day']=day.isoformat()
                 st.session_state['auto_cover_cg']=cg   # 下一次畫面更新時自動找代班
             st.rerun()
         except ValueError as exc:st.error(str(exc))
@@ -169,8 +170,18 @@ def render_leave(store, caregivers, tasks, result, overrides):
     if blocks:
         with st.expander(f'已登錄不可排時段 · {len(blocks)}'):
             st.dataframe(pd.DataFrame([{'編號':b['id'],'居服員':names.get(b['cg'],b['cg']),'開始':b['start'],'結束':b['end'],'原因':b['reason']} for b in blocks]),hide_index=True,width='stretch')
-            bid=st.selectbox('撤銷時段', [b['id'] for b in blocks])
+            def _block_text(i):
+                b=next((x for x in blocks if x['id']==i),None)
+                return str(i) if b is None else f"{i}｜{names.get(b['cg'],b['cg'])}｜{b['start'][:10]} {b['start'][11:16]}～{b['end'][11:16]}（{b['reason']}）"
+            bid=st.selectbox('撤銷時段', [b['id'] for b in blocks], format_func=_block_text)
+            restore=st.checkbox('撤銷後，把這段時間代班的服務還給原居服員', value=True,
+                                help='逐筆檢查原居服員是否仍有空；有衝突的保留代班並列出原因。')
             if st.button('撤銷選取時段'):
+                chosen=next(b for b in blocks if b['id']==bid)
                 store.remove_block(bid)
-                st.session_state['workflow_notice']='已撤銷不可排時段；已改派的服務不會自動還原。'
+                if restore:
+                    st.session_state['restore_after_revoke']={'cg':chosen['cg'],'start':chosen['start'],'end':chosen['end']}
+                    st.session_state['workflow_notice']='已撤銷不可排時段，正在把代班的服務還給原居服員…'
+                else:
+                    st.session_state['workflow_notice']='已撤銷不可排時段；已改派的服務維持代班。'
                 st.rerun()

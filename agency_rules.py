@@ -51,7 +51,7 @@ def leave_overlap(task, caregiver):
         except ValueError:
             return ''
     for block in blocks if isinstance(blocks, list) else []:
-        if block.get('reason') == '請假' and overlap(task, block):
+        if str(block.get('reason', '')).startswith('請假') and overlap(task, block):
             return f"請假 {block['start']}～{block['end']}"
     return ''
 
