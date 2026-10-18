@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 import caregiver_engine as engine
-from agency_rules import consecutive_workdays_error, daily_pay, leave_overlap, payroll_tables, primary_guard
+from agency_rules import daily_pay, leave_overlap, payroll_tables, primary_guard
 from dispatch_workflow import WorkflowStore, attach_blocks
 from monthly_scheduler import run_fixed_period_dispatch
 from schedule_checks import workload_error
@@ -193,31 +193,6 @@ def test_full_period_manual_check_derives_monthly_budget_without_cached_ledger()
     assigned=pd.DataFrame([{'任務ID':t['任務ID'],'派單居服員':'A'} for t in tasks[:-1]])
     checked=check(tasks,'t11',assigned=assigned,cfg=config(continuous_work_limit_mins=1000))
     assert not checked['available'] and '每月加班工時超標' in checked['detail']
-
-
-def test_consecutive_workdays_error_blocks_only_the_7th_day():
-    cfg = config()
-    # 已連續上班 6 天（11/02～11/07），第 7 天（11/08）必須擋下；只到第 6 天（11/07）本身仍放行。
-    cfg.worker_workdays = {'A': {f'2026-11-{d:02}' for d in range(2, 8)}}
-    assert consecutive_workdays_error('A', '2026-11-08', cfg)
-    assert not consecutive_workdays_error('A', '2026-11-07', cfg)
-    # 中間斷過一天，第 7 天前的連續鏈就重新起算，不應被擋。
-    cfg.worker_workdays = {'A': {'2026-11-02', '2026-11-03', '2026-11-04', '2026-11-06', '2026-11-07'}}
-    assert not consecutive_workdays_error('A', '2026-11-08', cfg)
-    # 沒有紀錄的居服員（例如代班的 B）不受既有狀態影響。
-    assert not consecutive_workdays_error('B', '2026-11-08', cfg)
-
-
-def test_workflow_store_persists_workdays_across_scopes_and_lookback_window(tmp_path):
-    store = WorkflowStore('inst', tmp_path / 'workflow.sqlite3')
-    store.record_workdays([('A', '2026-10-29'), ('A', '2026-10-30'), ('A', '2026-11-05'), ('', '2026-11-01')])
-    # 10 天回溯窗（11/01 之前 10 天＝10/22～10/31）只含窗內日期，11/05 在窗外不回傳。
-    seed = store.recent_workdays('2026-11-01', lookback=10)
-    assert seed == {'A': {'2026-10-29', '2026-10-30'}}
-    # 同一 institution_key（scope）跨月持久；不同機構互不可見。
-    assert WorkflowStore('inst', tmp_path / 'workflow.sqlite3').recent_workdays('2026-12-01', lookback=40)['A'] == \
-        {'2026-10-29', '2026-10-30', '2026-11-05'}
-    assert WorkflowStore('other', tmp_path / 'workflow.sqlite3').recent_workdays('2026-12-01', lookback=40) == {}
 
 
 def test_sa10_self_pay_has_no_public_revenue_and_preserves_mismatch():

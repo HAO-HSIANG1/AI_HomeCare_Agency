@@ -9,7 +9,7 @@ from collections import Counter
 import re
 import pandas as pd
 from ortools.linear_solver import pywraplp
-from agency_rules import leave_overlap, clean, finite, monthly_overtime_error, consecutive_workdays_error
+from agency_rules import leave_overlap, clean, finite, monthly_overtime_error
 from source_fields import source_primary_map, seniority_score, resolve_worker
 from care_policy import dementia_status, special_qualification_error, DEFAULT_CODE_CERTS
 from recurring_schedule import visit_pattern, representative_days
@@ -42,7 +42,6 @@ def failure_kind(detail):
         (['休息不足'],'休息不足','保留不含交通的休息空檔'),
         (['空檔','交通加緩衝'],'轉場空檔不足','延長轉場空檔或調整新案整案人選'),
         (['不排班','可排班星期'],'可服務星期','核對休息日與固定服務星期'),
-        (['連續上班'],'連續工作天數','不得連續上班逾上限天數；核對休息日安排或改由人工插單並確認提醒'),
         (['工時超標'],'工時上限','調整服務時段與工作量'),
         (['交通','座標'],'交通資料','核對座標與路網連線'),
     ]:
@@ -51,16 +50,11 @@ def failure_kind(detail):
     return '資料或其他限制','查看逐人原因並核對服務計畫'
 
 
-def run_fixed_period_dispatch(tasks,caregivers,clients,config,primary_map=None,progress=None,routine_templates=None,
-        worker_workday_seed=None):
+def run_fixed_period_dispatch(tasks,caregivers,clients,config,primary_map=None,progress=None,routine_templates=None):
     """Choose new owners on the recurring template; extend fixed routes.
 
     Regular motorcycle worker/day routes are copied after date eligibility and
     month-ledger checks. Leave, changed plans and transit are checked separately.
-
-    worker_workday_seed：{居服員ID:{日期字串,...}}，本期間開始日之前（跨月）已確定的上班日，
-    供「連續上班天數」硬性規則回溯種子；只套用在真實日期序列的那一次 _run_expanded_dispatch，
-    代表性週型（representative_days）那一次日期是抽樣、非連續日曆，不套用此規則。
     """
     tasks = merge_task_client_tables(tasks,clients).copy()
     tasks['日期'] = pd.to_datetime(tasks['日期'],errors='coerce').dt.strftime('%Y-%m-%d')
@@ -68,23 +62,21 @@ def run_fixed_period_dispatch(tasks,caregivers,clients,config,primary_map=None,p
     original = source_primary_map(clients,set(caregivers['居服員ID'].astype(str)),primary_map)
     unknown = set(tasks['案家ID'].astype(str)) - set(original)
     if not unknown:
-        result = _run_expanded_dispatch(tasks,caregivers,clients,config,original,progress,day_templates=routine_templates,
-            worker_workday_seed=worker_workday_seed)
+        result = _run_expanded_dispatch(tasks,caregivers,clients,config,original,progress,day_templates=routine_templates)
         result['dispatch_stats'].update(template_service_count=len(representative_days(tasks,caregivers)),
                                         period_service_count=len(tasks))
         return result
     basis = representative_days(tasks,caregivers)
     notify = (lambda v,label:progress(v*.55,'週期模板：'+label)) if progress else None
     regular = _run_expanded_dispatch(basis,caregivers,clients,config,original,notify,
-                                    compute_routes=False,day_templates=routine_templates,allow_backup=False,
-                                    enforce_consecutive_days=False)
+                                    compute_routes=False,day_templates=routine_templates,allow_backup=False)
     notify = (lambda v,label:progress(.55+v*.45,'延展班表：'+label)) if progress else None
     # Pass the chosen owners directly. Candidate search does not repeat on each
     # later week. Unresolved clients retain their template diagnostic.
     result = _run_expanded_dispatch(tasks,caregivers,clients,config,
         regular['client_primary_map'],notify,day_templates=regular['_day_templates'],
         historical_labels=original,skip_owner_search=True,
-        missing_diagnostics=regular['diagnostics'],worker_workday_seed=worker_workday_seed)
+        missing_diagnostics=regular['diagnostics'])
     result['dispatch_stats'].update(template_service_count=len(basis),period_service_count=len(tasks),
         template_day_count=basis['日期'].nunique(),ownership_search_clients=len(unknown),
         historical_clients=len(original),new_clients=len(unknown))
@@ -93,8 +85,7 @@ def run_fixed_period_dispatch(tasks,caregivers,clients,config,primary_map=None,p
 
 def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,progress=None,
         compute_routes=True,day_templates=None,historical_labels=None,
-        skip_owner_search=False,missing_diagnostics=None,allow_backup=True,
-        enforce_consecutive_days=True,worker_workday_seed=None):
+        skip_owner_search=False,missing_diagnostics=None,allow_backup=True):
     tasks = merge_task_client_tables(tasks,clients).copy()
     tasks['日期'] = pd.to_datetime(tasks['日期'],errors='coerce').dt.strftime('%Y-%m-%d')
     if tasks['日期'].isna().any():
@@ -115,10 +106,6 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
     fixed = dict(owners)
     historical = dict(owners) if historical_labels is None else dict(historical_labels)
     config.client_primary_map,config.primary_profiles,config.work_day_minutes = owners,profiles,{}
-    # 連續上班天數的硬性規則狀態：只有真實日期序列的那一次套用種子並累計；
-    # 代表性週型（representative_days）那一次日期是抽樣、非連續日曆，一律從空白起算且不強制。
-    config.worker_workdays = ({str(k):set(v) for k,v in (worker_workday_seed or {}).items()}
-                               if enforce_consecutive_days else {})
     backups = {}
     config.client_backup_map = backups
     days = {day:group.copy() for day,group in tasks.groupby('日期')}
@@ -197,12 +184,6 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
         hard = hard_check(task,worker,cfg)
         if hard:
             return {'available':False,'detail':hard,'reason':'hard_constraint'}
-        if enforce_consecutive_days:
-            # 絕對硬性規則：AI 不得把居服員排到連續上班第 7 天（見 agency_rules.consecutive_workdays_error）。
-            # 這是隨排班進度變動的狀態性檢查，不能跟上面 hard_check 共用記憶化快取，因此獨立判斷、每次都查。
-            consecutive = consecutive_workdays_error(worker,task['日期'],cfg)
-            if consecutive:
-                return {'available':False,'detail':consecutive,'reason':'consecutive_days'}
         lookup = cfg.dispatch_cache['days'][id(days[task['日期']])]['lookup']
         others = current['任務ID'].to_numpy()[current['派單居服員'].to_numpy()==worker] if len(current) else []
         neighbors = []
@@ -240,7 +221,6 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
         day = task['日期']
         if not batch:
             assigned[day] = pd.concat([assigned[day],pd.DataFrame([{'任務ID':task['任務ID'],'派單居服員':worker}])],ignore_index=True)
-        config.worker_workdays.setdefault(str(worker),set()).add(str(day)[:10])
         set_work_minutes(worker,day,checked['working_minutes'])
         occupied_slots.setdefault((worker,day),[]).append(task)
         if not absence and not source:
@@ -271,11 +251,7 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
             records.sort(key=lambda t:(str(t['案家ID']) not in historical,t['時間窗_開始'],t['任務ID']))
             key = template_key(records,worker)
             cached = templates.get(key) if key else None
-            # 連續上班天數規則是逐日曆日生效的，「相同週型直接複製」這條快速路徑假設各天可互換，
-            # 在這點上不成立：同一人、同一週型，連續天數到了第7天就必須擋，不能照抄前面天的核可結果。
-            # 不滿足就退回下面逐任務 check_visit 的慢路徑，讓硬性規則照常生效、原因照常記錄。
-            template_blocked_by_streak = enforce_consecutive_days and bool(consecutive_workdays_error(worker,day,config))
-            if cached and template_month_fits(worker,day,cached['working_minutes']) and not template_blocked_by_streak:
+            if cached and template_month_fits(worker,day,cached['working_minutes']):
                 lookup = {pattern_of(t):t for t in records}
                 substitutions = {old:lookup[pattern]['任務ID'] for pattern,old in cached['old_ids'].items()}
                 token = re.compile('|'.join(re.escape(k) for k in sorted(substitutions,key=len,reverse=True)))
@@ -421,10 +397,7 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
             candidates = scored.sort_values(['適配度分數','居服員ID'],ascending=[False,True])['居服員ID'].astype(str).tolist() if not scored.empty else []
         best = None
         for worker in candidates:
-            # 同一候選人要接下該案整期間的所有服務（多天），worker_workdays 同樣要給獨立複本並逐筆
-            # 累計，否則連續上班天數會被低估（理由見上方 try_backup 的註解）。
-            trial = replace(config,client_primary_map={**owners,client:worker},work_day_minutes=dict(config.work_day_minutes),
-                            worker_workdays={k:set(v) for k,v in config.worker_workdays.items()})
+            trial = replace(config,client_primary_map={**owners,client:worker},work_day_minutes=dict(config.work_day_minutes))
             tentative,checked_rows,task_errors = {},[],{}
             potentially_available = []
             for _,task in visits.iterrows():
@@ -452,7 +425,6 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
                 checked_rows.append((task,checked))
                 tentative[day] = pd.concat([current,pd.DataFrame([{'任務ID':task['任務ID'],'派單居服員':worker}])],ignore_index=True)
                 trial.work_day_minutes[(worker,day)] = checked['working_minutes']
-                trial.worker_workdays.setdefault(worker,set()).add(str(day)[:10])
             if checked_rows and (best is None or coverage(checked_rows)>coverage(best[1])):
                 best = worker,checked_rows,task_errors
             if len(checked_rows)+sum(bool(leave_overlap(task,profiles[worker])) for _,task in visits.iterrows())==len(visits):
@@ -561,12 +533,8 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
         return seeded + (others[:limit] if limit else others)
 
     def try_backup(client,visits,worker):
-        # worker_workdays 必須給 trial 一份獨立複本（而非與主 config 共用參照）並隨著本次試算逐筆
-        # 累計：visits 按日期排序試算，同一次試算裡前面幾天「暫定」會接受，必須讓後面天數的連續
-        # 上班檢查看得到，否則同一個候選人一次試算涵蓋多天時，連續天數會被低估而漏放第7天。
         trial = replace(config,client_backup_map={**backups,client:backups.get(client,())+(worker,)},
-                        work_day_minutes=dict(config.work_day_minutes),
-                        worker_workdays={k:set(v) for k,v in config.worker_workdays.items()})
+                        work_day_minutes=dict(config.work_day_minutes))
         tentative,accepted = {},[]
         for task in visits:
             if leave_overlap(task,profiles[worker]) or hard_check(task,worker,trial):
@@ -579,7 +547,6 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
             accepted.append((task,checked))
             tentative[day] = pd.concat([current,pd.DataFrame([{'任務ID':task['任務ID'],'派單居服員':worker}])],ignore_index=True)
             trial.work_day_minutes[(worker,day)] = checked['working_minutes']
-            trial.worker_workdays.setdefault(worker,set()).add(str(day)[:10])
         return accepted
 
     if extras_on:
@@ -683,11 +650,8 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
                     best = None
                     for shift in shifts:
                         for worker in pool:
-                            # 同一位候選人要接下 recs 裡該案的多天時段，worker_workdays 同樣要給獨立複本並
-                            # 逐筆累計（理由見上方 try_backup 的註解），否則連續上班天數會被低估。
                             trial = replace(config,client_backup_map={**backups,client:backups.get(client,())+(() if worker in current_team else (worker,))},
-                                            work_day_minutes=dict(config.work_day_minutes),
-                                            worker_workdays={k:set(v) for k,v in config.worker_workdays.items()})
+                                            work_day_minutes=dict(config.work_day_minutes))
                             accepted = []
                             for rec in recs:
                                 begin,finish = to_min(rec['時間窗_開始'])+shift,to_min(rec['時間窗_結束'])+shift
@@ -704,7 +668,6 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
                                 if checked:
                                     accepted.append((rec,start,end,checked))
                                     trial.work_day_minutes[(worker,rec['日期'])] = checked['working_minutes']
-                                    trial.worker_workdays.setdefault(worker,set()).add(str(rec['日期'])[:10])
                             if accepted and (best is None or len(accepted)>len(best[2])):
                                 best = shift,worker,accepted
                             if len(accepted)==len(recs):

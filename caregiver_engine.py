@@ -232,10 +232,6 @@ class PipelineConfig:
     normal_daily_hours: float = 8.0
     max_daily_hours: float = 12.0
     max_monthly_overtime_hours: float = 46.0
-    # 勞動合規：絕對不得連續上班超過此天數（預設 6 天，第 7 天硬性擋下）。
-    # AI 排班（monthly_scheduler.check_visit）一律硬性擋下，不經任何覆寫；
-    # 人工插單／人工改派只提醒不擋（見 agency_rules.consecutive_workdays_error 的呼叫端）。
-    max_consecutive_work_days: int = 6
     # 主責＋1位固定備援：預設關閉。開啟後，固定人選因時段重疊、休息日、休息不足或缺證照
     # 而無法承接的服務，才由該案「同一位」備援居服員承接；備援通過所有資格、交通、工時檢查。
     enable_backup_caregiver: bool = False
@@ -253,13 +249,6 @@ class PipelineConfig:
     primary_profiles: dict = field(default_factory=dict, repr=False)
     work_day_minutes: dict = field(default_factory=dict, repr=False)
     dispatch_cache: dict = field(default_factory=dict, repr=False)
-    # 連續上班天數硬性規則的執行期狀態：{居服員ID:{日期字串,...}}。宣告為正式欄位（而非動態
-    # attach），讓 dataclasses.replace()（例如備援試算的 trial config）會照既有慣例一併帶過去，
-    # 不會因為只複製宣告欄位而遺漏，導致備援路徑悄悄跳過這條硬性規則。
-    worker_workdays: dict = field(default_factory=dict, repr=False)
-    # 跨月回溯種子：{居服員ID:{日期字串,...}}，由呼叫端（app.py）從 WorkflowStore 讀取並指派，
-    # 供 find_insertion_candidates／人工改派提醒使用；AI 批次排班用 worker_workdays 本身即可。
-    worker_workday_seed: dict = field(default_factory=dict, repr=False)
 
 # ==========================================
 # 資料載入
@@ -2615,7 +2604,7 @@ def find_insertion_candidates(
         "待接任務時段", "重疊任務與時段",
         "前一任務（結束）", "下一任務（開始）",
         "前段交通時間(分)", "後段交通時間(分)", "插單後排班工時(小時)",
-        "擾動成本", "推薦原因", "不可插入原因", "連續上班提醒",
+        "擾動成本", "推薦原因", "不可插入原因",
     ]
     if phase1.empty:
         return pd.DataFrame(columns=output_columns)
@@ -2624,26 +2613,6 @@ def find_insertion_candidates(
     if current_tasks is not None and not current_tasks.empty:
         for _, r in current_tasks.iterrows():
             task_lookup[r["任務ID"]] = r
-
-    # 「連續上班天數」提醒（人工插單只警示、不擋）：合併跨月持久種子
-    # （config.worker_workday_seed，由呼叫端從 WorkflowStore 讀取）與目前有效班表
-    # （current_tasks/current_result）的已派日期，當作每位候選人「已上班日」集合。
-    # 共用 agency_rules.consecutive_workdays_error 同一顆判斷函式，門檻與訊息與 AI 硬性規則一致。
-    from agency_rules import consecutive_workdays_error as _consecutive_workdays_error
-    new_day = None
-    if date_column in task_series.index and pd.notna(task_series.get(date_column)):
-        try:
-            new_day = pd.Timestamp(task_series.get(date_column)).strftime("%Y-%m-%d")
-        except (ValueError, TypeError):
-            new_day = None
-    workdays_by_cg = {str(k): set(v) for k, v in (getattr(config, "worker_workday_seed", {}) or {}).items()}
-    if new_day and current_tasks is not None and not current_tasks.empty and current_result is not None and not current_result.empty:
-        _merged = current_result.merge(current_tasks[["任務ID", date_column]], on="任務ID", how="left")
-        for _cg, _day in zip(_merged["派單居服員"], _merged[date_column]):
-            if pd.isna(_day):
-                continue
-            workdays_by_cg.setdefault(str(_cg), set()).add(pd.Timestamp(_day).strftime("%Y-%m-%d"))
-    config.worker_workdays = workdays_by_cg
 
     result_rows = []
     check_tasks = None
@@ -2796,8 +2765,6 @@ def find_insertion_candidates(
         else:
             recommendation = ""
 
-        consecutive_notice = (_consecutive_workdays_error(cg_id, new_day, config) or "") if (available and new_day) else ""
-
         result_rows.append(
             {
                 "居服員ID": cg_id,
@@ -2819,7 +2786,6 @@ def find_insertion_candidates(
                 "擾動成本": 0 if available else 100,
                 "推薦原因": recommendation,
                 "不可插入原因": reason,
-                "連續上班提醒": consecutive_notice,
             }
         )
 

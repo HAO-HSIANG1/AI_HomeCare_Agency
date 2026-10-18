@@ -27,7 +27,7 @@ def setting(key, default=None):
 
 
 def endpoint():
-    return str(setting('CAREFLOW_OSRM_MOTORCYCLE_HOST', 'https://careflow-osrm-motorcycle.onrender.com')).rstrip('/')
+    return str(setting('CAREFLOW_OSRM_MOTORCYCLE_HOST', 'http://127.0.0.1:5001')).rstrip('/')
 
 
 def is_remote(host):
@@ -54,10 +54,7 @@ def request_json(host, path, params=None, local_timeout=10, startup=False):
     read = seconds('CAREFLOW_OSRM_WARMUP_TIMEOUT', 65) if startup else (
         seconds('CAREFLOW_OSRM_REMOTE_READ_TIMEOUT', 30) if remote else local_timeout)
     timeout = (seconds('CAREFLOW_OSRM_CONNECT_TIMEOUT', 5), read)
-    # Render 等免費方案閒置會把容器關掉，下一個請求要冷啟動；第一次 timeout 很常見是
-    # 容器還在醒來，不是真的連不上——遠端一律重試一次，讓第二次有機會打到已經醒的服務。
-    # 本機服務逾時多半是真的連線問題，重試沒有意義，維持只打一次。
-    attempts = 2 if remote else 1
+    attempts = 1 if startup or not remote else 2
     for attempt in range(attempts):
         try:
             response = requests.get(host + path, params=params, timeout=timeout)

@@ -65,7 +65,7 @@ from dispatch_message import parse_dispatch_message, redact_message
 from temp_case import slots_to_frame, build_temp_tasks, search_slots, single_caregiver_plan
 from eligibility import explain_slot, screen_caregivers, client_profile, simulate_worker, month_overtime_summary, worker_status_table
 from source_fields import source_primary_map, normalize_clients
-from agency_rules import payroll_tables, primary_guard, leave_overlap, consecutive_workdays_error
+from agency_rules import payroll_tables, primary_guard, leave_overlap
 from osrm_client import ensure_ready
 from schedule_output import build_schedule_output, schedule_excel_bytes, MAIN_COLUMNS
 from dispatch_workflow import WorkflowStore, attach_blocks, blocked_reason, render_leave
@@ -898,7 +898,7 @@ def _current_input_signature():
         client_primary_map={}, primary_profiles={}, work_day_minutes={})).encode())
     signature.update(st.session_state.get('careflow_travel_provider','local').encode())
     signature.update(repr(sorted(__import__('caregiver_engine').TRANSIT_FALLBACK.items())).encode())
-    signature.update(st.session_state.get('CAREFLOW_OSRM_MOTORCYCLE_HOST',os.getenv('CAREFLOW_OSRM_MOTORCYCLE_HOST','https://careflow-osrm-motorcycle.onrender.com')).encode())
+    signature.update(st.session_state.get('CAREFLOW_OSRM_MOTORCYCLE_HOST',os.getenv('CAREFLOW_OSRM_MOTORCYCLE_HOST','http://127.0.0.1:5001')).encode())
     return signature.hexdigest()
 
 _live_signature = _current_input_signature()
@@ -973,19 +973,12 @@ else:
                 _routine_signature = hashlib.sha256((df_cg.to_json(date_format='iso',default_handler=str)+
                     repr(replace(config,client_primary_map={},primary_profiles={},work_day_minutes={},dispatch_cache={}))+
                     st.session_state.get('careflow_travel_provider','local')+
-                    st.session_state.get('CAREFLOW_OSRM_MOTORCYCLE_HOST',os.getenv('CAREFLOW_OSRM_MOTORCYCLE_HOST','https://careflow-osrm-motorcycle.onrender.com'))).encode()).hexdigest()
+                    st.session_state.get('CAREFLOW_OSRM_MOTORCYCLE_HOST',os.getenv('CAREFLOW_OSRM_MOTORCYCLE_HOST','http://127.0.0.1:5001'))).encode()).hexdigest()
                 _routine_cache = st.session_state.get('_routine_templates',{})
-                # 連續上班天數硬性規則（AI 絕對不可排到連續第7天）需要跨月回溯：讀本期間開始日
-                # 往前10天、本機構已確定的上班日當種子，傳入排班引擎逐日累計檢查。
-                _consecutive_seed = _workflow_store.recent_workdays(range_start, lookback=10)
                 period_result = run_fixed_period_dispatch(df_tasks_all, df_cg, df_cl, config,
                     primary_map=config.client_primary_map, progress=lambda value,text: progress.progress(value,text=text),
-                    routine_templates=_routine_cache.get('templates') if _routine_cache.get('signature')==_routine_signature else None,
-                    worker_workday_seed=_consecutive_seed)
+                    routine_templates=_routine_cache.get('templates') if _routine_cache.get('signature')==_routine_signature else None)
                 st.session_state['_routine_templates']={'signature':_routine_signature,'templates':period_result['_day_templates']}
-                # 批次完成即寫回持久帳本，供下一次（含跨月）排班回溯「連續上班天數」。
-                if not period_result['df_result'].empty:
-                    _workflow_store.record_workdays(zip(period_result['df_result']['派單居服員'], period_result['df_result']['排班日期']))
                 _moved = period_result.get('time_shifts')
                 if _moved is not None and not _moved.empty:
                     _new_times = _moved.set_index('任務ID')
@@ -1022,10 +1015,6 @@ if "last_result" in st.session_state:
     config.client_backup_map = dict(res.get('client_backup_map') or (res.get('phase2') or {}).get('client_backup_map') or {})
     config.primary_profiles = {str(r['居服員ID']):r.to_dict() for _,r in res['df_cg'].iterrows()}
     config.work_day_minutes = dict(res.get('work_day_minutes', {}))
-    # 人工插單／人工改派的「連續上班」提醒種子：本期間開始日往前10天本機構已確定的上班日。
-    # 只在此處重算一次（本次畫面重跑共用），每個 config 實例都會被下方各入口讀取。
-    _period_first_day = pd.to_datetime(res['df_tasks'].get('日期'), errors='coerce').min() if '日期' in res['df_tasks'].columns else None
-    config.worker_workday_seed = _workflow_store.recent_workdays(_period_first_day, lookback=10) if pd.notna(_period_first_day) else {}
 
     df_tasks = res["df_tasks"]
 
@@ -1114,30 +1103,6 @@ if "last_result" in st.session_state:
                 tasks=pd.concat([tasks,pd.DataFrame([pending])],ignore_index=True)
         return tasks, effective
 
-    def _consecutive_days_notice(cg_id, day, tasks_frame, result_frame):
-        """人工改派／人工插單共用：只提醒不擋。合併跨月種子（config.worker_workday_seed）與
-        目前有效班表，判斷指派 cg_id 到 day 是否會連續上班達上限+1天；與 AI 硬性規則
-        （agency_rules.consecutive_workdays_error）同一顆函式、同一套門檻與文案。"""
-        day = pd.to_datetime(day, errors='coerce')
-        if pd.isna(day) or not cg_id:
-            return None
-        workdays = {str(k): set(v) for k, v in (getattr(config, 'worker_workday_seed', {}) or {}).items()}
-        if tasks_frame is not None and not tasks_frame.empty and result_frame is not None and not result_frame.empty and '日期' in tasks_frame.columns:
-            merged = result_frame.merge(tasks_frame[['任務ID', '日期']], on='任務ID', how='left')
-            for _cg, _day in zip(merged['派單居服員'], merged['日期']):
-                if pd.isna(_day):
-                    continue
-                workdays.setdefault(str(_cg), set()).add(pd.Timestamp(_day).strftime('%Y-%m-%d'))
-        prior_seed = config.worker_workdays if hasattr(config, 'worker_workdays') else None
-        config.worker_workdays = workdays
-        try:
-            return consecutive_workdays_error(cg_id, day.strftime('%Y-%m-%d'), config)
-        finally:
-            if prior_seed is None:
-                del config.worker_workdays
-            else:
-                config.worker_workdays = prior_seed
-
     def _remember_owner(task, cg):
         client=str(task.get('案家ID',''))
         if cg and client and not config.client_primary_map.get(client):
@@ -1192,10 +1157,6 @@ if "last_result" in st.session_state:
             config.client_primary_map[str(cl_id)] = str(new_cg_id)
             res['client_primary_map'] = dict(config.client_primary_map)
         st.session_state.pop('last_override_propagation', None)
-        if new_cg_id and not task_rows.empty and '日期' in task_rows.columns:
-            _notice = _consecutive_days_notice(new_cg_id, task_rows.iloc[0]['日期'], check_tasks, df_result_effective)
-            if _notice:
-                st.session_state.setdefault('consecutive_days_notices', []).append(_notice)
         return None
 
 
@@ -2521,8 +2482,6 @@ if "last_result" in st.session_state:
                 + '。明細見下方表格。')
         if st.session_state.get('workflow_notice'):
             st.success(st.session_state.pop('workflow_notice'))
-        for _notice in st.session_state.pop('consecutive_days_notices', []):
-            st.warning('⚠️ ' + _notice)
 
         def _task_picker(prefix, tasks, assigned=None, keep_unassigned=False):
             """案家 → 日期 → 服務，逐層縮小範圍；不必在上千筆任務的單一下拉選單裡找。回傳任務ID，沒有可選時回傳 None。"""
@@ -2865,12 +2824,6 @@ if "last_result" in st.session_state:
                         })
                         _remember_owner(task, cg_id)
                         _workflow_store.remove_pending(str(task["任務ID"]))
-                        _tasks_after, _effective_after = _workflow_frames()
-                        _notice = _consecutive_days_notice(cg_id, task["日期"], _tasks_after, _effective_after)
-                        if _notice:
-                            st.session_state.setdefault("consecutive_days_notices", []).append(_notice)
-                    # 批次插單完成即寫回持久帳本，供下一次（含跨月）排班／插單回溯「連續上班天數」。
-                    _workflow_store.record_workdays((done["cg_id"], done["task"]["日期"]) for done in committed)
                     st.session_state["workflow_notice"] = f"✅ 已插入 {len(committed)} 個時段（{caregiver_label(committed[0]['cg_id'])}"\
                         + ("等" if len({c['cg_id'] for c in committed}) > 1 else "") + "）；既有班表沒有被移動，並已建立稽覈紀錄。"
                     st.session_state.pop("tc", None)
@@ -3943,11 +3896,6 @@ if "last_result" in st.session_state:
         else:
             df_final['預估居服員薪資'] = float('nan')
         res['_final_table_cache'] = (_final_key, df_final.copy())
-        # 最終有效班表（含居督覆寫與臨時插單）重建完成即寫回持久帳本，確保跨月回溯「連續上班天數」
-        # 用的是當下真正生效的指派，不是尚未套用覆寫前的 AI 原始建議。
-        if '日期' in df_final.columns and '最終派單居服員' in df_final.columns:
-            _final_assigned = df_final[df_final['最終派單居服員'].astype(str) != '未指派']
-            _workflow_store.record_workdays(zip(_final_assigned['最終派單居服員'], _final_assigned['日期']))
     st.caption('沿用週服務計畫欄位，加入派單居服員與逐段交通。交通時間為估計分鐘，原檔的0不當成實測；空白表示尚未計算。姓名依上方「顯示姓名」設定呈現。')
     @st.fragment
     def _schedule_view():
