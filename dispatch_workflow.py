@@ -48,6 +48,7 @@ class WorkflowStore:
             db.execute('CREATE TABLE IF NOT EXISTS pending(scope TEXT, task TEXT, body TEXT, PRIMARY KEY(scope,task))')
             db.execute('CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, scope TEXT, task TEXT, at TEXT, body TEXT)')
             db.execute('CREATE TABLE IF NOT EXISTS client_primary(scope TEXT, client TEXT, cg TEXT, updated TEXT, PRIMARY KEY(scope,client))')
+            db.execute('CREATE TABLE IF NOT EXISTS workdays(scope TEXT, cg TEXT, date TEXT, PRIMARY KEY(scope,cg,date))')
     def connect(self): return sqlite3.connect(self.path, timeout=15)
     def primary_map(self):
         with self.connect() as db:
@@ -133,6 +134,26 @@ class WorkflowStore:
     def history(self, tid):
         with self.connect() as db:
             return db.execute('SELECT at,body FROM history WHERE scope=? AND task=? ORDER BY id DESC LIMIT 20',(self.scope,str(tid))).fetchall()
+    def record_workdays(self, pairs):
+        """pairs：(居服員ID, 日期) 的可疊代序列，寫入本機構已確定的上班日。scope 以 institution_key
+        為準、不隨月份變動，供下一次排班（含下個月）查「連續上班天數」時跨月回溯使用。"""
+        rows = {(str(cg).strip(), str(day)[:10]) for cg, day in pairs if str(cg).strip() and str(day).strip()}
+        if not rows:
+            return
+        with self.connect() as db:
+            db.executemany('INSERT OR IGNORE INTO workdays VALUES(?,?,?)', [(self.scope, cg, day) for cg, day in rows])
+    def recent_workdays(self, before_date, lookback=10):
+        """回傳 {居服員ID: {日期字串,...}}：before_date 之前 lookback 天內、本機構已確定的上班日，
+        作為新一輪排班「連續上班天數」判斷的跨月種子。before_date 當天不含在內。"""
+        before = pd.Timestamp(before_date).strftime('%Y-%m-%d')
+        start = (pd.Timestamp(before_date) - pd.Timedelta(days=lookback)).strftime('%Y-%m-%d')
+        with self.connect() as db:
+            rows = db.execute('SELECT cg,date FROM workdays WHERE scope=? AND date>=? AND date<?',
+                               (self.scope, start, before)).fetchall()
+        out = {}
+        for cg, day in rows:
+            out.setdefault(cg, set()).add(day)
+        return out
 
 def attach_blocks(frame, store):
     result=frame.copy();items=store.blocks()
