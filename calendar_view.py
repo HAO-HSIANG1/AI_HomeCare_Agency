@@ -1,9 +1,10 @@
 """CareFlow 班表工作台：單日全員、個人整週與異動清單。"""
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 from datetime import date, datetime, timedelta
 import re
 import pandas as pd
 import streamlit as st
+from careflow_ui import reason_picker, REASON_HINT
 
 
 def apply_overrides_to_result(frame, overrides):
@@ -301,11 +302,15 @@ def _assignment_dialog(row, labels, on_list_candidates, can_reassign, can_move=F
     saved = st.session_state.get("cf_dialog_candidates", {})
     ranked = saved.get("rows", []) if saved.get("task_id") == task_id else []
     status = {str(r.get("cg_id") or r.get("居服員ID")): r for r in ranked}
-    choices = sorted(labels, key=lambda cg: (not status.get(cg, {}).get("available", False), cg))
+    # 依代班挑選順序（熟悉→前一案交通→本月工時→年資）排列；可派者附上挑選理由。
+    position = {cg: i for i, cg in enumerate(status)}
+    choices = sorted(labels, key=lambda cg: (not status.get(cg, {}).get("available", False), position.get(cg, len(position)), cg))
     def option_label(cg):
         info = status.get(cg)
         if info is None:
             return labels[cg] + " · 尚未檢查"
+        if info.get("available") and info.get("rank_reason"):
+            return labels[cg] + " · ✅ " + str(info["rank_reason"])
         return labels[cg] + (" · " + str(info.get("detail") or ("可派" if info.get("available") else "不符合條件")))
     choice = st.selectbox("指定居服員", choices, index=choices.index(row["cg"]) if row["cg"] in choices else None, placeholder="搜尋或選擇居服員", format_func=option_label, key="cf_dialog_cg_" + task_id)
     st.caption("可直接選人；按『確認安排』時仍會重新檢查是否可派。")
@@ -314,13 +319,13 @@ def _assignment_dialog(row, labels, on_list_candidates, can_reassign, can_move=F
         changed_date = st.date_input("新日期", value=pd.Timestamp(row['date']).date(), key='cf_edit_date_' + task_id)
         changed_time = st.time_input("新開始時間", value=datetime.strptime(row['start'], '%H:%M').time(), step=300, key='cf_edit_time_' + task_id)
         st.caption('服務分鐘維持原長度；只更換居服員時不用修改。')
-    reason = st.text_input("安排／改派原因（必填）", placeholder="例如：補排未安排服務、臨時代班", key="cf_dialog_reason_" + task_id)
+    reason = reason_picker("cf_dialog_reason_" + task_id, "安排／改派原因（必選）")
     c1, c2 = st.columns(2)
     if c1.button("確認安排", type="primary", width="stretch", key="cf_dialog_confirm_" + task_id, disabled=not can_reassign):
         if choice is None:
             st.warning("請先選擇居服員。")
-        elif not reason.strip():
-            st.warning("請填寫安排原因。")
+        elif not reason:
+            st.warning(REASON_HINT)
         else:
             if changed_date.isoformat() != row['date'] or changed_time.strftime('%H:%M') != row['start']:
                 if not can_move:
@@ -335,9 +340,9 @@ def _assignment_dialog(row, labels, on_list_candidates, can_reassign, can_move=F
                     st.warning('服務不能跨日。')
                     return
                 draft = {'task_id':task_id, 'cg_id':choice, 'date':changed_date.isoformat(), 'start':changed_time.strftime('%H:%M'), 'end':end.strftime('%H:%M')}
-                st.session_state['cf_assignment_request'] = {'kind':'move','task_id':task_id,'draft':draft,'scope':scope,'reason':reason.strip()}
+                st.session_state['cf_assignment_request'] = {'kind':'move','task_id':task_id,'draft':draft,'scope':scope,'reason':reason}
             else:
-                st.session_state["cf_assignment_request"] = {"task_id": task_id, "cg_id": choice, "scope": scope, "reason": reason.strip()}
+                st.session_state["cf_assignment_request"] = {"task_id": task_id, "cg_id": choice, "scope": scope, "reason": reason}
             st.rerun()
     if c2.button("取消", width="stretch", key="cf_dialog_cancel_" + task_id):
         _close_assignment_dialog()
@@ -352,15 +357,15 @@ def _move_dialog(original, draft, labels, can_move):
     if st.session_state.get('cf_dialog_error'):
         st.error(st.session_state['cf_dialog_error'])
     scope = st.radio('套用範圍', ['僅本次'], horizontal=True, key='cf_move_scope')
-    reason = st.text_input('調整原因（必填）', key='cf_move_reason')
+    reason = reason_picker('cf_move_reason', '調整原因（必選）')
     c1,c2=st.columns(2)
     if c1.button('確認調整', type='primary', key='cf_confirm_move', disabled=not can_move):
-        if not reason.strip():
-            st.warning('請填寫調整原因。')
+        if not reason:
+            st.warning(REASON_HINT)
         elif scope != '僅本次' and (draft['date'], draft['start'], draft['end']) != (original['date'], original['start'], original['end']):
             st.warning('更改日期或時段時請選「僅本次」。')
         else:
-            st.session_state['cf_assignment_request'] = {'kind':'move', 'task_id':original['id'], 'draft':draft, 'scope':scope, 'reason':reason.strip()}
+            st.session_state['cf_assignment_request'] = {'kind':'move', 'task_id':original['id'], 'draft':draft, 'scope':scope, 'reason':reason}
             st.rerun()
     if c2.button('取消', key='cf_cancel_move'):
         _close_assignment_dialog()
@@ -486,18 +491,39 @@ def render_calendar_overview(result, tasks, caregivers, overrides=None, on_reass
     with right:
         visible_day = selected_day.isoformat() if mode == "全員日班" else None
         pending=[r for r in rows if not r["cg"] and (visible_day is None and r["date"] in days or r["date"]==visible_day)]
-        st.markdown(f"**待安排 · {len(pending)}**")
-        for row in pending[:12]:
-            with st.container(border=True):
-                st.markdown(f"**{row['client_label']}** · {row['code']}")
-                st.caption(f"{row['date']} {row['start']}–{row['end']}")
-                if st.button("安排居服員", key="cf_pending_"+row["id"]):
-                    pending_clicked = True
-                    _open_assignment_dialog(row["id"])
-        if not pending:
-            st.caption("這段期間沒有未安排服務。")
-        if len(pending)>12:
-            st.caption(f"還有 {len(pending)-12} 筆，請縮小日期範圍。")
+        go_issues = kwargs.get('on_go_issues')
+        if go_issues and pending:
+            # 未派的原因與建議方案集中在「03 衝突與異常處理」，這裡只提示並引導過去，不重複一份清單。
+            clients = sorted({r['client_label'] for r in pending})
+            st.markdown(
+                f"<div class='cf-guide-card'><div class='cf-guide-title'>🧩 這段期間有 {len(pending)} 筆服務待安排"
+                f"（{len(clients)} 個案家）</div><div class='cf-guide-body'>{'、'.join(clients[:6])}"
+                f"{' 等' if len(clients) > 6 else ''}<br>每一筆排不進的原因、系統建議方案（後移時間、換人、拆兩段）"
+                f"都在「03 衝突與異常處理」，按下方按鈕過去處理。</div></div>", unsafe_allow_html=True)
+            st.button("前往 03 處理未派案家 →", key="cf_go_issues", type="primary", width="stretch", on_click=go_issues)
+            with st.expander("已經知道要給誰？直接在這裡指定（進階）"):
+                for row in pending[:12]:
+                    c1, c2 = st.columns([3, 1], vertical_alignment="center")
+                    c1.markdown(f"**{row['client_label']}** · {row['code']}<br><span style='color:#667e76'>{row['date']} {row['start']}–{row['end']}</span>",
+                                unsafe_allow_html=True)
+                    if c2.button("指定", key="cf_pending_"+row["id"], width="stretch"):
+                        pending_clicked = True
+                        _open_assignment_dialog(row["id"])
+                if len(pending) > 12:
+                    st.caption(f"還有 {len(pending)-12} 筆，請縮小日期範圍。")
+        else:
+            st.markdown(f"**待安排 · {len(pending)}**")
+            for row in pending[:12]:
+                with st.container(border=True):
+                    st.markdown(f"**{row['client_label']}** · {row['code']}")
+                    st.caption(f"{row['date']} {row['start']}–{row['end']}")
+                    if st.button("安排居服員", key="cf_pending_"+row["id"]):
+                        pending_clicked = True
+                        _open_assignment_dialog(row["id"])
+            if not pending:
+                st.caption("✅ 這段期間沒有未安排服務。")
+            if len(pending)>12:
+                st.caption(f"還有 {len(pending)-12} 筆，請縮小日期範圍。")
     action = getattr(grid, 'action', None) if grid is not None else None
     if action and action.get('nonce') != st.session_state.get('cf_last_grid_action'):
         st.session_state['cf_last_grid_action'] = action.get('nonce')
@@ -537,14 +563,15 @@ def render_task_override_picker(tasks,result,caregivers,overrides,on_reassign=No
     task_id=st.selectbox("選擇任務",ids,key="calendar_override_task")
     caregiver_ids=[str(x) for x in caregivers.get("居服員ID",pd.Series(dtype=object)).dropna()]
     ranked=on_list_candidates(task_id,caregiver_ids) if callable(on_list_candidates) else []
-    labels={str(r.get("cg_id") or r.get("居服員ID")): ("✅ 可派" if r.get("available") else "⚠️ "+str(r.get("detail") or "需確認")) for r in ranked or []}
-    choice=st.selectbox("改派居服員",["未指派"]+caregiver_ids,format_func=lambda x:x if x=="未指派" else x+"｜"+labels.get(x,""),key="calendar_override_caregiver")
-    reason=st.text_input("改派原因",key="calendar_override_reason")
+    labels={str(r.get("cg_id") or r.get("居服員ID")): (("✅ "+str(r.get("rank_reason") or "可派")) if r.get("available") else "⚠️ "+str(r.get("detail") or "需確認")) for r in ranked or []}
+    ordered_ids=[i for i in labels if i in set(caregiver_ids)]+[i for i in caregiver_ids if i not in labels]
+    choice=st.selectbox("改派居服員",["未指派"]+ordered_ids,format_func=lambda x:x if x=="未指派" else x+"｜"+labels.get(x,""),key="calendar_override_caregiver")
+    reason=reason_picker("calendar_override_reason","改派原因（必選）")
     c1,c2=st.columns(2)
     if c1.button("套用改派",key="calendar_apply_override",width="stretch"):
-        if not reason.strip():st.warning("請填寫原因。")
+        if not reason:st.warning(REASON_HINT)
         elif callable(on_reassign):
-            err=on_reassign(task_id,None if choice=="未指派" else choice,reason.strip())
+            err=on_reassign(task_id,None if choice=="未指派" else choice,reason)
             if err:st.error(str(err))
             else:st.success("已套用改派。");st.rerun()
     if c2.button("清除此任務覆寫",key="calendar_clear_override",width="stretch") and callable(on_clear_override):

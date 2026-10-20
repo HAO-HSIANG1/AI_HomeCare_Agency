@@ -4,7 +4,7 @@
 畫面照常顯示，卡片先顯示「分析中」，算好就自動換成原因與建議。結果依「班表簽章」存在記憶體，
 簽章不變（只是開關視窗、換案家）就直接取用。
 """
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 import os
 import threading
 import time
@@ -37,7 +37,8 @@ def memo_for(session, sig, case, worker):
 
 
 def prefetch_case(tasks, caregivers, clients, config, case):
-    """把「這個案家的位置 ↔ 全部服務位置／居服員住家」的機車路網一次抓回來（批次、已有的不重抓）。失敗不影響分析。"""
+    """把「這個案家的位置 ↔ 全部服務位置／居服員住家」的機車路網一次抓回來（批次、已有的不重抓）。失敗不影響分析。
+    case 可以是一個案家，或多個案家的清單（全部未派案家一起抓，請求數更少）。"""
     try:
         import caregiver_engine as engine
         merged = engine.merge_task_client_tables(tasks, clients)
@@ -47,14 +48,16 @@ def prefetch_case(tasks, caregivers, clients, config, case):
         def points(frame, a, b):
             return [(float(x), float(y)) for x, y in zip(pd.to_numeric(frame[a], errors='coerce'), pd.to_numeric(frame[b], errors='coerce'))
                     if np.isfinite(x) and np.isfinite(y)]
-        mine = points(merged.loc[merged['案家ID'].astype(str).eq(str(case))], lat_col, lon_col)
+        cases = {str(c) for c in case} if isinstance(case, (list, tuple, set)) else {str(case)}
+        mine = points(merged.loc[merged['案家ID'].astype(str).isin(cases)], lat_col, lon_col)
         everyone = points(merged, lat_col, lon_col)
         if '服務起點_緯度(家)' in caregivers:
             everyone += points(caregivers, '服務起點_緯度(家)', '服務起點_經度(家)')
         if not mine:
             return
+        # 一次請求就拿回雙向時間，所以只要查「這些案家 → 所有地點」；回程已在同一批結果裡。
         engine.prefetch_osrm_travel_times(mine, everyone, config.travel_min_per_km)
-        engine.prefetch_osrm_travel_times(everyone, mine, config.travel_min_per_km)
+        engine.prefetch_osrm_travel_times(everyone, mine, config.travel_min_per_km)   # 通常已全在快取，不會再查
     except Exception:
         pass
 
@@ -109,6 +112,10 @@ def submit(key, fn):
     except Exception:
         add_script_run_ctx = script_ctx = None
 
+    # 背景執行緒沿用這個連線的設定（交通估算開關、Google 查詢狀態等 ContextVar），不會退回全站預設值。
+    import contextvars
+    run_ctx = contextvars.copy_context()
+
     def work():
         if script_ctx is not None:
             try:
@@ -116,9 +123,13 @@ def submit(key, fn):
             except Exception:
                 pass
         slot['state'] = 'running'
+        started = time.time()
         try:
-            slot['entry'] = fn()
+            slot['entry'] = run_ctx.run(fn)
             slot['state'] = 'done'
+            slot['seconds'] = round(time.time() - started, 2)
+            if os.environ.get('CAREFLOW_TIMING'):
+                print('[analysis]', key[2:], slot['seconds'], 's')
         except Exception as exc:  # noqa: BLE001
             slot['error'] = str(exc)[:200]
             slot['state'] = 'error'

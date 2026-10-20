@@ -1,5 +1,5 @@
 """v14 tests: LINE message parsing, offline geocoding, batch temp-case search, eligibility screen, version stamps."""
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 import pathlib, unittest
 import pandas as pd
 

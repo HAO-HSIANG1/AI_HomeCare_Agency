@@ -1,5 +1,5 @@
 """Pure operational schedule/route views. Rendering and export never call map APIs."""
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 from io import BytesIO
 import hashlib
 import json
@@ -47,6 +47,21 @@ def clock(value):
     return parsed.strftime('%H:%M') if pd.notna(parsed) else value
 
 
+def _taipei_stamp(day, hhmm, plus_minutes=0.0):
+    """'YYYY-MM-DD' + 'HH:MM' (+分鐘) → 台北時間 ISO 字串（台灣沒有日光節約，固定 +08:00）。
+    與 pd.Timestamp(...).tz_localize('Asia/Taipei').isoformat() 結果相同，但不必每筆交給 pandas 解析。"""
+    from datetime import datetime, timedelta
+    try:
+        ts = datetime.strptime(f'{day[:10]} {hhmm}', '%Y-%m-%d %H:%M')
+    except ValueError:
+        ts = pd.to_datetime(day + ' ' + hhmm, errors='coerce')
+        if pd.isna(ts):
+            return ''
+        ts = ts.to_pydatetime()
+    ts += timedelta(minutes=float(plus_minutes or 0.0))
+    return ts.isoformat() + '+08:00'
+
+
 def describe_routes(assignments, tasks, caregivers, buffer_mins=15):
     """Describe home→first visit→subsequent visits, resetting at each worker/day."""
     columns = ['任務ID', '派單居服員', '交通日期', '交通方式', '出發地類型', '起點案號',
@@ -89,13 +104,7 @@ def describe_routes(assignments, tasks, caregivers, buffer_mins=15):
             if day != '單日' and query_clock:
                 stamp = (day, query_clock, 0.0 if first else buffer)
                 if stamp not in stamp_cache:
-                    ts = pd.to_datetime(day + ' ' + query_clock, errors='coerce')
-                    if pd.notna(ts):
-                        if not first:
-                            ts += pd.Timedelta(minutes=buffer)
-                        stamp_cache[stamp] = ts.tz_localize('Asia/Taipei').isoformat()
-                    else:
-                        stamp_cache[stamp] = ''
+                    stamp_cache[stamp] = _taipei_stamp(day, query_clock, 0.0 if first else buffer)
                 query_time = stamp_cache[stamp]
             fingerprint = [task_id, cg_id, day, clock(task.get('時間窗_開始')),
                            clock(task.get('時間窗_結束')), mode, prev_id, query_time,

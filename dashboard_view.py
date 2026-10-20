@@ -1,5 +1,5 @@
 """派單儀錶板畫面（Streamlit 原生元件，不產生圖片，每次重跑幾乎不花時間）。"""
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 import pandas as pd
 import streamlit as st
 

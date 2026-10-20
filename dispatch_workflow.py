@@ -1,5 +1,5 @@
 """Unified local dispatch follow-up and availability. No external messages are sent."""
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 import hashlib
 import json
 import sqlite3
@@ -168,11 +168,16 @@ def render_leave(store, caregivers, tasks, result, overrides):
     if not labels:
         st.info('請先載入居服員資料。');return
     with st.form('availability_form'):
-        cg=st.selectbox('居服員',list(labels),format_func=lambda x:names.get(x,x))
-        day=st.date_input('日期',value=pd.to_datetime(tasks['日期']).min().date())
-        mode=st.radio('不可排範圍',['整天','指定時段（可多段）'],horizontal=True)
-        raw=st.text_area('指定時段：每行一段',value='09:00-11:00\n14:00-15:00',help='選整天時忽略此欄。時間格式 HH:MM-HH:MM。')
-        reason=st.selectbox('原因',['請假','看診','教育訓練','家庭事務','其他不可排'])
+        # 有 key 才能由「載入示範案例」預先帶入；預設值放在 session，避免與元件預設重複設定。
+        st.session_state.setdefault('leave_form_day', pd.to_datetime(tasks['日期']).min().date())
+        st.session_state.setdefault('leave_form_raw', '09:00-11:00\n14:00-15:00')
+        if st.session_state.get('leave_form_cg') not in labels:
+            st.session_state.pop('leave_form_cg', None)
+        cg=st.selectbox('居服員',list(labels),format_func=lambda x:names.get(x,x),key='leave_form_cg')
+        day=st.date_input('日期',value=None,key='leave_form_day') or pd.to_datetime(tasks['日期']).min().date()
+        mode=st.radio('不可排範圍',['整天','指定時段（可多段）'],horizontal=True,key='leave_form_mode')
+        raw=st.text_area('指定時段：每行一段',help='選整天時忽略此欄。時間格式 HH:MM-HH:MM。',key='leave_form_raw')
+        reason=st.selectbox('原因',['請假','看診','教育訓練','家庭事務','其他不可排'],key='leave_form_reason')
         submitted=st.form_submit_button('登錄不可排時間',type='primary')
     if submitted:
         try:
@@ -181,7 +186,7 @@ def render_leave(store, caregivers, tasks, result, overrides):
             store.add_blocks(cg,day.isoformat(),spans,reason)
             assignment=dict(zip(result.get('任務ID',[]),result.get('派單居服員',[])))
             affected=sum(1 for _,t in tasks.iterrows() if str(assignment.get(t['任務ID'],''))==str(cg) and any(b['cg']==str(cg) and overlap(t,b) for b in store.blocks()))
-            st.session_state['workflow_notice']=f'已登錄不可排時間，本次有 {affected} 筆已派服務受影響，已標為待安排，請到「人工調整班表」改派。'
+            st.session_state['workflow_notice']=f'已登錄不可排時間，本次有 {affected} 筆已派服務受影響，已標為待安排，請到「02 智慧排班作業」的人工調整改派。'
             if reason=='請假':
                 st.session_state['auto_cover_day']=day.isoformat()
                 st.session_state['auto_cover_cg']=cg   # 下一次畫面更新時自動找代班

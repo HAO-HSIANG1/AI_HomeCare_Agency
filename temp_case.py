@@ -2,7 +2,7 @@
 
 No Streamlit here. The Streamlit page only collects the case, calls these functions and renders.
 """
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 
 from datetime import datetime
 
@@ -113,7 +113,7 @@ def _col(frame, *names):
 
 
 def single_caregiver_plan(results: list[dict]) -> pd.DataFrame:
-    """所有時段都「可直接插入」的居服員，依平均適配分數高、擾動成本低排序。"""
+    """所有時段都「可直接插入」的居服員，依代班挑選順序（各時段排名平均）排列，附第一個時段的挑選理由。"""
     if not results:
         return pd.DataFrame()
     per_slot = []
@@ -121,9 +121,11 @@ def single_caregiver_plan(results: list[dict]) -> pd.DataFrame:
         f = r['frame']
         if f.empty:
             return pd.DataFrame()
-        ok = f[f['可直接插入'] == True]  # noqa: E712
+        ok = f[f['可直接插入'] == True].copy()  # noqa: E712
+        ok['_位置'] = range(len(ok))   # find_insertion_candidates 已依代班挑選順序排好
         score_col = _col(ok, '適配度分數', '適配分數')
-        per_slot.append(ok.set_index('居服員ID')[[c for c in (score_col, '擾動成本', '前段交通時間(分)') if c]])
+        keep = [c for c in (score_col, '擾動成本', '前段交通時間(分)', '代班排序理由', '_位置') if c]
+        per_slot.append(ok.set_index('居服員ID')[keep])
     common = set(per_slot[0].index)
     for p in per_slot[1:]:
         common &= set(p.index)
@@ -132,20 +134,10 @@ def single_caregiver_plan(results: list[dict]) -> pd.DataFrame:
         scores = [float(p.at[cg, p.columns[0]]) for p in per_slot]
         cost = sum(float(p.at[cg, '擾動成本']) if '擾動成本' in p else 0.0 for p in per_slot)
         travel = [float(p.at[cg, '前段交通時間(分)']) for p in per_slot if '前段交通時間(分)' in p and pd.notna(p.at[cg, '前段交通時間(分)'])]
+        rank = sum(float(p.at[cg, '_位置']) for p in per_slot) / len(per_slot)
+        reason = per_slot[0].at[cg, '代班排序理由'] if '代班排序理由' in per_slot[0] else ''
         rows.append({'居服員ID': str(cg), '平均適配分數': sum(scores) / len(scores), '擾動成本合計': cost,
-                     '平均前段交通(分)': (sum(travel) / len(travel)) if travel else float('nan'), '可涵蓋時段數': len(per_slot)})
-    plan = pd.DataFrame(rows, columns=['居服員ID', '平均適配分數', '擾動成本合計', '平均前段交通(分)', '可涵蓋時段數'])
-    return plan.sort_values(['擾動成本合計', '平均適配分數'], ascending=[True, False], kind='stable').reset_index(drop=True)
-
-
-def blocked_summary(results: list[dict], top: int = 6) -> pd.DataFrame:
-    """所有時段都找不到人時，統計每位居服員被擋的原因，幫居督判斷要放寬什麼。"""
-    rows = []
-    for r in results:
-        f = r['frame']
-        if f.empty or '不可插入原因' not in f:
-            continue
-        label = f"{pd.Timestamp(r['task']['日期']):%m/%d} {r['task']['時間窗_開始']}-{r['task']['時間窗_結束']}"
-        for _, c in f[f['可直接插入'] != True].iterrows():  # noqa: E712
-            rows.append({'時段': label, '居服員ID': str(c['居服員ID']), '原因': str(c['不可插入原因'])})
-    return pd.DataFrame(rows, columns=['時段', '居服員ID', '原因'])
+                     '平均前段交通(分)': (sum(travel) / len(travel)) if travel else float('nan'), '可涵蓋時段數': len(per_slot),
+                     '平均排序': rank, '挑選理由': reason})
+    plan = pd.DataFrame(rows, columns=['居服員ID', '平均適配分數', '擾動成本合計', '平均前段交通(分)', '可涵蓋時段數', '平均排序', '挑選理由'])
+    return plan.sort_values(['擾動成本合計', '平均排序', '居服員ID'], kind='stable').reset_index(drop=True)

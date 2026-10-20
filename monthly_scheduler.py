@@ -3,7 +3,7 @@
 Every visit uses the central constraints. Only actual leave permits a backup.
 This constructs a feasible draft, not a proven global optimum.
 """
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 from dataclasses import replace
 from collections import Counter
 import re
@@ -19,7 +19,7 @@ from caregiver_engine import (
     calculate_schedule_travel, caregiver_has_cert, calculate_task_revenue_and_salary,
     merge_task_client_tables, run_phase1_matching, validate_dispatch_inputs,
     prefetch_osrm_travel_times,
-    warm_transit_routes,
+    warm_transit_routes, calc_travel_minutes, calc_distance_km,
     iter_service_codes, SPECIAL_CERT_REQUIREMENTS,
 )
 
@@ -28,7 +28,7 @@ MATCH_COLUMNS = ['任務ID','案家ID','居服員ID','適配度分數','預估�
     '是否歷史首選','具備失智症20小時認證(0/1)','常用交通工具']
 RESULT_COLUMNS = ['任務ID','案家ID','派單居服員','適配分數','預估車程(分)',
     '服務時段','任務優先級','地點緯度','地點經度','預估服務營收','預估居服員薪資',
-    '原首選替換原因','排班來源','排班日期','固定居服員ID','是否請假代班','代班原因']
+    '原首選替換原因','排班來源','排班日期','固定居服員ID','是否請假代班','代班原因','代班排序理由']
 
 
 BACKUP_STAGES = ('歷史首選核對','新案固定人選核對','新案整案配對')
@@ -130,6 +130,7 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
     financial = calculate_task_revenue_and_salary(tasks,config).set_index('任務ID').to_dict('index')
     assigned = {day:pd.DataFrame(columns=['任務ID','派單居服員']) for day in days}
     rows,matches,diagnostics,rankings,leave_tasks = [],[],[],{},[]
+    served = Counter()   # (案家ID, 居服員ID) → 本次班表已服務次數；代班挑選的「熟悉」依據
     checked_patterns = {}
     hard_results,occupied_slots = {},{}
     task_records = {t['任務ID']:t for t in tasks.to_dict('records')}
@@ -239,8 +240,9 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
             '失敗階段':stage,'問題分類':category,'建議處理':action,'候選數':count,
             '剔除原因':detail,'逐人排班原因':reasons or {}})
 
-    def commit(task,worker,checked,absence='',batch=False,source=''):
+    def commit(task,worker,checked,absence='',batch=False,source='',rank_reason=''):
         day = task['日期']
+        served[(str(task['案家ID']),str(worker))] += 1
         if not batch:
             assigned[day] = pd.concat([assigned[day],pd.DataFrame([{'任務ID':task['任務ID'],'派單居服員':worker}])],ignore_index=True)
         config.worker_workdays.setdefault(str(worker),set()).add(str(day)[:10])
@@ -258,7 +260,8 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
             '地點經度':task.get('服務地點_經度'),'預估服務營收':fin['預估服務營收'],
             '預估居服員薪資':fin['預估居服員薪資'],'原首選替換原因':absence,'代班原因':absence,
             '排班來源':source or ('請假代班' if absence else '歷史首選' if str(task['案家ID']) in historical else '新案固定人選'),
-            '排班日期':day,'固定居服員ID':owners[str(task['案家ID'])],'是否請假代班':bool(absence)})
+            '排班日期':day,'固定居服員ID':owners[str(task['案家ID'])],'是否請假代班':bool(absence),
+            '代班排序理由':rank_reason})
 
     # Reserve each fixed worker's weekly route once, then copy identical days.
     for i,(day,frame) in enumerate(days.items()):
@@ -504,18 +507,58 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
                     'failed':failed,'working_minutes':config.work_day_minutes.get((worker,day),0),
                     'old_ids':{pattern_of(t):t['任務ID'] for t in records}}
 
+    seed_backups = {}
+    if '歷史備援' in clients:
+        known_workers = set(profiles)
+        for _,row in clients.iterrows():
+            ids = [resolve_worker(v,known_workers) for v in re.split(r'[、,，;；\s]+',clean(row.get('歷史備援'))) if v]
+            ids = tuple(dict.fromkeys(i for i in ids if i in known_workers))
+            if ids:
+                seed_backups[clean(row.get('案家ID'))] = ids
+
+    # ---- 代班挑選順序（與畫面上的臨時異動共用 substitute_rank）：熟悉 → 前一案交通區段 → 本月工時 → 年資 ----
+    from substitute_rank import build_profile as _sub_profile, order_workers as _sub_order, month_summary as _sub_month
+    _estimate = lambda la1,lo1,la2,lo2: calc_distance_km(float(la1),float(lo1),float(la2),float(lo2))*float(config.travel_min_per_km)
+
+    def _same_day_visits(worker,day,current=None):
+        frame = assigned[day] if current is None else current
+        if not len(frame):
+            return []
+        lookup = config.dispatch_cache['days'][id(days[day])]['lookup']
+        ids = frame['任務ID'].to_numpy()[frame['派單居服員'].astype(str).to_numpy()==str(worker)]
+        return [{'start':str(lookup[t]['時間窗_開始'])[:5],'end':str(lookup[t]['時間窗_結束'])[:5],
+                 'lat':lookup[t].get('服務地點_緯度'),'lon':lookup[t].get('服務地點_經度'),'client':str(lookup[t]['案家ID'])}
+                for t in ids if t in lookup]
+
+    def substitute_order(task,workers,current=None):
+        """回傳 (依代班順序排好的居服員, {居服員: 排序資料})；只排先後，可不可派仍由 check_visit 決定。"""
+        client = str(task['案家ID'])
+        summary = _sub_month(config.work_day_minutes,str(task['日期'])[:7],config)
+        profiles_ = []
+        for worker in workers:
+            worker = str(worker)
+            if worker not in profiles:
+                continue
+            familiar = served[(client,worker)] or int(worker in seed_backups.get(client,()) or worker in backups.get(client,()))
+            profiles_.append(_sub_profile(worker,task,profiles[worker],config,others=_same_day_visits(worker,task['日期'],current),
+                familiar=familiar,ledger=config.work_day_minutes,summary=summary,travel_fn=calc_travel_minutes,estimate_fn=_estimate))
+        ordered = _sub_order(profiles_)
+        return [p['worker'] for p in ordered],{p['worker']:p for p in ordered}
+
     for i,task in enumerate(leave_tasks):
         if progress:
             progress(.85+.1*i/max(len(leave_tasks),1),f'核對請假代班 {i+1}/{len(leave_tasks)}')
         day = task['日期']
         scored = run_phase1_matching(pd.DataFrame([task]),caregivers,config)
         reasons = {}
-        candidates = scored.sort_values(['適配度分數','居服員ID'],ascending=[False,True])['居服員ID'] if not scored.empty else []
+        # 請假代班不再依適配度分數（含滿意度與住家距離）排序，改用代班挑選順序。
+        candidates,rank_info = substitute_order(task,scored['居服員ID'].astype(str).tolist() if not scored.empty else [])
         for worker in candidates:
             checked = check_visit(task,str(worker),assigned[day],config)
             if checked['available']:
                 rankings.setdefault(str(task['案家ID']),{}).update(scored.set_index('居服員ID').to_dict('index'))
-                commit(task,str(worker),checked,leave_overlap(task,profiles.get(owners[str(task['案家ID'])])))
+                commit(task,str(worker),checked,leave_overlap(task,profiles.get(owners[str(task['案家ID'])])),
+                       rank_reason=rank_info[str(worker)]['reason'])
                 break
             reasons[str(worker)] = checked['detail']
         else:
@@ -529,14 +572,6 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
     rescued = set()
     extras_on = allow_backup and getattr(config,'enable_backup_caregiver',False)
     max_extra = max(1,int(getattr(config,'max_backup_caregivers',1))) if extras_on else 0
-    seed_backups = {}
-    if '歷史備援' in clients:
-        known_workers = set(profiles)
-        for _,row in clients.iterrows():
-            ids = [resolve_worker(v,known_workers) for v in re.split(r'[、,，;；\s]+',clean(row.get('歷史備援'))) if v]
-            ids = tuple(dict.fromkeys(i for i in ids if i in known_workers))
-            if ids:
-                seed_backups[clean(row.get('案家ID'))] = ids
     done_ids = {tid for frame in assigned.values() for tid in frame['任務ID']}
     leave_ids = {str(t['任務ID']) for t in leave_tasks}
 
@@ -550,7 +585,14 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
                 found.setdefault(str(d['案家ID']),set()).add(tid)
         return found
 
-    def ranked_workers(client,owner,site,limit):
+    def ranked_workers(client,owner,site,limit,task=None):
+        if task is not None:
+            # 固定備援、時段調整與臨時支援：同一套代班挑選順序（以第一筆待補服務為代表）。
+            ordered,_ = substitute_order(task,[w for w in profiles if w!=owner])
+            seeded = [w for w in ordered if w in seed_backups.get(client,())]
+            others = [w for w in ordered if w not in seeded]
+            keep = set(seeded + (others[:limit] if limit else others))
+            return [w for w in ordered if w in keep]
         def distance(worker):
             home = profiles[worker].get('服務起點_緯度(家)'),profiles[worker].get('服務起點_經度(家)')
             try:
@@ -592,7 +634,7 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
                 continue
             visits = sorted((task_records[t] for t in tids),key=lambda t:(t['日期'],t['時間窗_開始'],t['任務ID']))
             site = visits[0].get('服務地點_緯度'),visits[0].get('服務地點_經度')
-            ranked = ranked_workers(client,owner,site,int(getattr(config,'backup_candidate_limit',0)) or None)
+            ranked = ranked_workers(client,owner,site,int(getattr(config,'backup_candidate_limit',0)) or None,task=visits[0])
             while len(backups.get(client,())) < max_extra:
                 visits = [t for t in visits if t['任務ID'] not in rescued]
                 if not visits:
@@ -609,7 +651,8 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
                 worker,accepted = best
                 backups[client] = backups.get(client,())+(worker,)
                 for task,checked in accepted:
-                    commit(task,worker,checked,source='備援居服員')
+                    _,_info = substitute_order(task,[worker])
+                    commit(task,worker,checked,source='備援居服員',rank_reason=_info.get(worker,{}).get('reason',''))
                     rescued.add(task['任務ID'])
                 backup_services += len(accepted)
 
@@ -682,7 +725,7 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
                         break
                     current_team = [owner]+list(backups.get(client,()))
                     room = max_extra-len(backups.get(client,())) if extras_on else 0
-                    pool = current_team + ([w for w in ranked_workers(client,owner,site,shift_limit) if w not in current_team] if room>0 else [])
+                    pool = current_team + ([w for w in ranked_workers(client,owner,site,shift_limit,task=recs[0]) if w not in current_team] if room>0 else [])
                     best = None
                     for shift in shifts:
                         for worker in pool:
@@ -756,15 +799,17 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
             team = {owner,*backups.get(client,())}
             visits = sorted((task_records[t] for t in tids),key=lambda t:(t['日期'],t['時間窗_開始'],t['任務ID']))
             site = visits[0].get('服務地點_緯度'),visits[0].get('服務地點_經度')
-            pool = [w for w in ranked_workers(client,owner,site,limit) if w not in team]
+            pool = [w for w in ranked_workers(client,owner,site,limit,task=visits[0]) if w not in team]
             helpers = []
             for task in visits:
                 tid = str(task['任務ID'])
-                for worker in helpers+[w for w in pool if w not in helpers]:
+                # 每一筆依當天實際的前一案重新排序；已支援過本案的人因「服務過」自然排在前面。
+                ordered,rank_info = substitute_order(task,helpers+[w for w in pool if w not in helpers])
+                for worker in ordered:
                     supports[tid] = worker
                     checked = check_visit(task,worker,assigned[task['日期']],config)
                     if checked['available']:
-                        commit(task,worker,checked,source='臨時支援')
+                        commit(task,worker,checked,source='臨時支援',rank_reason=rank_info[worker]['reason'])
                         rescued.add(task['任務ID'])
                         support_services += 1
                         if worker not in helpers:

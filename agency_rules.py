@@ -3,7 +3,7 @@
 Payroll is a planning estimate for ordinary working days, not a payroll settlement.
 Home commuting is excluded. Inter-client travel and the working buffer count as work.
 """
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 import json
 import math
 
@@ -72,6 +72,10 @@ def primary_guard(task, caregiver, config):
     # 固定人選都排不進時，系統為「這一次服務」指定的臨時支援，不擴大為整案備援。
     support = getattr(config, 'task_support_map', {}).get(clean(task.get('任務ID')))
     if support and clean(caregiver.get('居服員ID')) == clean(support):
+        return None
+    # 處長規則：以「1 主責＋最多 2 備援」為原則；固定人選都排不進這一次服務時，可以再選其他合格居服員。
+    # 呼叫端先確認固定人選都不行，才暫時把這筆服務放進 open_support_tasks（不擴大為整案備援）。
+    if clean(task.get('任務ID')) in {clean(t) for t in (getattr(config, 'open_support_tasks', None) or ())}:
         return None
     profile = config.primary_profiles.get(owner)
     if leave_overlap(task, profile):

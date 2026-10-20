@@ -1,5 +1,5 @@
 """v18 tests: demand heat map, month-ledger memo, route-signature stability, plan memo."""
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 import unittest
 import pandas as pd
 from dashboard_metrics import demand_heat, peak_slots, build_dashboard

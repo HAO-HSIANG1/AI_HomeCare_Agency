@@ -1,5 +1,5 @@
 """v17 tests: plain-language reasons, readable edit summary, plan notes, case-workbook builder."""
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 import unittest
 import pandas as pd
 from pending_advice import plain_reason, edits_summary, empty_edits, apply_suggestion, _plan_notes, diagnose
