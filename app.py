@@ -3053,8 +3053,14 @@ if "last_result" in st.session_state:
             if _demo_message:
                 from html import escape as _esc
                 st.markdown(
-                    "<div class='cf-line'><div class='cf-line-head'>💬 LINE 派案群組　·　示範訊息（虛構，姓名與門牌已遮蔽）</div>"
-                    f"<div class='cf-line-bubble'>{_esc(_demo_message)}</div></div>", unsafe_allow_html=True)
+                    # 樣式直接寫在元素上（不依賴頁首樣式表），雲端部署版本也一定是藍底對話框；換行改用 <br>，不會被擠成一段。
+                    "<div class='cf-line' style='background:linear-gradient(180deg,#9bb6dd,#8aa9d6);border-radius:16px;"
+                    "padding:14px 16px 18px;margin:6px 0 10px;'>"
+                    "<div class='cf-line-head' style='color:#fff;font-size:13px;font-weight:700;letter-spacing:.04em;margin-bottom:10px;'>"
+                    "💬 LINE 派案群組　·　示範訊息（虛構，姓名與門牌已遮蔽）</div>"
+                    "<div class='cf-line-bubble' style='display:inline-block;max-width:min(560px,100%);background:#fff;color:#1f2b2a;"
+                    "border-radius:18px;padding:12px 16px;font-size:15px;line-height:1.75;box-shadow:0 2px 6px rgba(0,0,0,.12);margin-left:10px;'>"
+                    + _esc(_demo_message).replace("\r", "").replace("\n", "<br>") + "</div></div>", unsafe_allow_html=True)
                 if st.session_state.get("tc"):
                     st.caption("⬇️ 下方是系統從這段訊息讀出來的內容，請對照確認。")
                 else:
