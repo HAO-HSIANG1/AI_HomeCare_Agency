@@ -83,10 +83,12 @@ class CaseWorkbookTests(unittest.TestCase):
             ids = [r[0].value for r in res['員工資料'].iter_rows(min_row=2)]
             self.assertEqual(ids, ['M01', 'M04', 'M05'])
             cases = [r[0].value for r in res['個案資料'].iter_rows(min_row=2)]
-            self.assertEqual(cases, ['A1', 'DEMO0003', 'DEMO0004'])
+            self.assertEqual(cases, ['A1', 'DEMO0003', 'DEMO0004', 'DEMO0005'])
             plan = {r[1].value: r for r in res['週服務計畫'].iter_rows(min_row=2)}
             self.assertEqual(plan['DEMO0003'][3].value, '12:30:00')
             self.assertEqual(plan['DEMO0004'][11].value, 'BA02(1) BA20(1)')   # 示範「新增足部照護需求」前的原本服務
+            days = [r[2].value for r in res['週服務計畫'].iter_rows(min_row=2) if r[1].value == 'DEMO0005']
+            self.assertEqual(days, ['星期二', '星期五'])                          # 示範「新增失智」：一週兩天
 
 
 class StampTests(unittest.TestCase):

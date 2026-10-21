@@ -8,6 +8,8 @@
   • DEMO0004 周○雄：每週二 13:00～14:00 基本日常照顧＋陪伴（BA02＋BA20），固定居服員 03816，正常排得進。
         用來示範「臨時異動 → 🩺 個案照顧需求變更 → 新增足部照護（BA08）」：照專複評後新增 BA08，
         03816 沒有足部照護訓練 → 寬限期補訓／交接／改由有訓練的人（例如 F5005）。
+  • DEMO0005 陳○妹：每週二、五 08:00～09:00 基本日常照顧＋陪伴（BA02＋BA20），固定居服員 M04（沒有失智症訓練）。
+        用來示範「🩺 個案照顧需求變更 → 新增失智」：照專複評後確認失智 → 寬限期補訓／交接／改由有失智症訓練的人。
 再加上你原本就有的 N1112090025（週三 5 小時連續服務）：必須拆成兩段，示範由 M04＋M05 各做一段。
 """
 import sys
@@ -19,6 +21,7 @@ CASES = [
     # 案號, 姓名, 歷史首選, 星期, 開始, 結束, 分鐘, 服務項目, 說明
     ('DEMO0003', '吳○蘭', 'E6279', '星期一', '12:30:00', '13:20:00', 50, 'BA08(1)', '空檔不夠 → 後移 30 分鐘'),
     ('DEMO0004', '周○雄', '03816', '星期二', '13:00:00', '14:00:00', 60, 'BA02(1) BA20(1)', '03816 長期服務；示範新增足部照護需求'),
+    ('DEMO0005', '陳○妹', 'M04', '星期二、星期五', '08:00:00', '09:00:00', 60, 'BA02(1) BA20(1)', 'M04 長期服務；示範新增失智'),
 ]
 LON, LAT = 121.5175, 24.9912
 
@@ -75,13 +78,14 @@ def build(src, out):
         if '歷史備援' in hc:
             vals[hc['歷史備援']] = None
         _append(clients, vals, ctpl)
-        w = {hw[k]: weekly.cell(wtpl, hw[k]).value for k in hw}
-        w.update({hw['案號']: case, hw['星期']: day, hw['開始時間']: start, hw['結束時間']: end, hw['服務時數']: minutes / 60,
-                  hw['服務分鐘']: minutes, hw['費用類型']: '基本', hw['頻率']: '每週', hw['生效日']: '2026-04-24', hw['到期日']: None,
-                  hw['服務項目']: items, hw['經度 (WGS84_Lon)']: LON, hw['緯度 (WGS84_Lat)']: LAT})
-        if '狀態' in hw:
-            w[hw['狀態']] = None
-        _append(weekly, w, wtpl)
+        for one_day in day.split('、'):          # 一週多天：每天一列
+            w = {hw[k]: weekly.cell(wtpl, hw[k]).value for k in hw}
+            w.update({hw['案號']: case, hw['星期']: one_day, hw['開始時間']: start, hw['結束時間']: end, hw['服務時數']: minutes / 60,
+                      hw['服務分鐘']: minutes, hw['費用類型']: '基本', hw['頻率']: '每週', hw['生效日']: '2026-04-24', hw['到期日']: None,
+                      hw['服務項目']: items, hw['經度 (WGS84_Lon)']: LON, hw['緯度 (WGS84_Lat)']: LAT})
+            if '狀態' in hw:
+                w[hw['狀態']] = None
+            _append(weekly, w, wtpl)
         _append(names_c, {1: case, 2: name}, names_c.max_row)
     wb.save(out)
     return out

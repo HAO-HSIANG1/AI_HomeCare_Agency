@@ -445,7 +445,7 @@ def find_need_change(ctx, need='dementia', prefer=None, budget=40.0, want_split=
     for client, frame in groups:
         if time.time() - started > budget:
             break
-        if not (2 <= len(frame) <= (16 if want_split else 8)) or client not in clients.index:
+        if not (2 <= len(frame) <= (16 if want_split or client == prefer else 8)) or client not in clients.index:
             continue
         if need == 'dementia' and dementia_status(clients.loc[client].to_dict()) is True:
             continue
@@ -484,4 +484,5 @@ def find_need_change(ctx, need='dementia', prefer=None, budget=40.0, want_split=
 
 
 def find_dementia(ctx, budget=40.0):
-    return find_need_change(ctx, 'dementia', budget=budget)
+    """示範用的 DEMO0005（M04 長期服務、沒有失智症訓練）優先；資料裡沒有時再從班表找。"""
+    return find_need_change(ctx, 'dementia', prefer='DEMO0005', budget=budget)
