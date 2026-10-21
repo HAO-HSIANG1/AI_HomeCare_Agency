@@ -2963,7 +2963,7 @@ if "last_result" in st.session_state:
                 labels[row['任務ID']] = text
             return right.selectbox('服務', list(labels), format_func=labels.get, key=f'{prefix}_pick_task_{client}_{day}')
 
-        _event_choices = ["➕ 臨時新增案件", "🚨 居服員臨時請假", "🕒 案家臨時改期", "⏱️ 前一服務延遲", "🧠 個案新增失智"]
+        _event_choices = ["➕ 臨時新增案件", "🚨 居服員臨時請假", "🕒 案家臨時改期", "⏱️ 前一服務延遲", "🩺 個案照顧需求變更"]
         _dynamic_event_type = big_tabs(_event_choices, "dynamic_event_type_selector", size="medium")
 
         def _infer_dispatch_year(tasks_df):
@@ -3005,10 +3005,13 @@ if "last_result" in st.session_state:
                 "redacted": redact_message(raw), "prefix": f"TEMP{stamp}", "client_id": f"TEMP_CLIENT_{stamp}",
                 "results": None,
             }
-            st.session_state["tc_raw"] = ""          # 解析完立即清掉原文，不留在畫面或工作階段
+            if raw.strip() != str(st.session_state.get("tc_demo_message") or "").strip():
+                st.session_state.pop("tc_demo_message", None)   # 貼的是真的派案訊息：不保留原文
+            st.session_state["tc_raw"] = ""          # 解析完立即清掉原文，不留在畫面或工作階段（示範訊息另外保留原文顯示）
 
         def _tc_clear():
             st.session_state.pop("tc", None)
+            st.session_state.pop("tc_demo_message", None)
             st.session_state["tc_raw"] = ""
 
         def _tc_relocate():
@@ -3046,6 +3049,16 @@ if "last_result" in st.session_state:
             st.markdown("##### ① 貼上 LINE 派案訊息")
             st.caption("整段貼上即可，姓名、門牌號維持遮蔽（O）沒關係。定位只用政府公開門牌資料，在這台主機上完成，"
                        "不會把地址送到 Google 或任何外部服務；解析完原文會立刻從畫面清掉。")
+            _demo_message = st.session_state.get("tc_demo_message")
+            if _demo_message:
+                from html import escape as _esc
+                st.markdown(
+                    "<div class='cf-line'><div class='cf-line-head'>💬 LINE 派案群組　·　示範訊息（虛構，姓名與門牌已遮蔽）</div>"
+                    f"<div class='cf-line-bubble'>{_esc(_demo_message)}</div></div>", unsafe_allow_html=True)
+                if st.session_state.get("tc"):
+                    st.caption("⬇️ 下方是系統從這段訊息讀出來的內容，請對照確認。")
+                else:
+                    st.caption("⬇️ 這是收到的原始訊息，也已放進下方輸入框；按「✨ 解析並定位」看系統讀出的資料。")
             st.text_area("派案訊息", height=150, key="tc_raw", label_visibility="collapsed",
                          placeholder="請問貴單位有人力嗎？\n姓名：劉O\n性別/年齡：女性82歲\n地址：新北市中和區大智街106巷O號\n失能等級：3\n失智：X　身障：X\n服務時間及項目：\n10/2(五)08:20~11:20 BA14+BA13\n備註：1.女性居服員…")
             b1, b2, _spacer = st.columns([1.3, 0.8, 4])
@@ -3304,9 +3317,11 @@ if "last_result" in st.session_state:
 
         # ---------- 🎬 示範案例：從目前班表自動找一個「找得到代班人選」的情境，並預先帶入下方欄位 ----------
         _demo_kinds = {"➕ 臨時新增案件": "new", "🚨 居服員臨時請假": "leave", "🕒 案家臨時改期": "reschedule", "⏱️ 前一服務延遲": "delay",
-                       "🧠 個案新增失智": "dementia"}
+                       "🩺 個案照顧需求變更": "needchange"}
         _demo_kind = _demo_kinds.get(_dynamic_event_type)
         _demo_buttons = ([('new1', '🎬 範例1：劉O 就醫陪同（單次）'), ('new2', '🎬 範例2：樓O志 失智（三次）')] if _demo_kind == 'new'
+                         else [('foot', '🎬 範例：DEMO0004 新增足部照護'), ('dementia', '🎬 範例：某案家新增失智'),
+                               ('needsplit', '🎬 範例：一位接不完，分給多位')] if _demo_kind == 'needchange'
                          else [(_demo_kind, '🎬 載入示範案例')])
 
         def _demo_context():
@@ -3355,26 +3370,38 @@ if "last_result" in st.session_state:
                 return (f"示範：{caregiver_label(worker)} 在 {day} 於 {client_label(client)} 的服務（原 {found['end']} 結束）延遲 {found['delay']} 分鐘，"
                         f"會趕不上下一案 {found['affected']}。下方已帶入，請按「🔎 確認延遲並檢查後續班」。"
                         f"預計第一順位代班：{caregiver_label(found['top'])}（{_label_ids_plain(found['reason'])}）。")
-            if kind == 'dementia':
+            if kind in ('dementia', 'foot', 'needsplit'):
                 client = str(found['client'])
+                st.session_state['qual_need'] = found['need']
                 st.session_state['qual_client'] = client
                 st.session_state['qual_since'] = pd.Timestamp(found['since']).date()
                 st.session_state['qual_method'] = 'grace'
                 st.session_state.pop('qual_avail', None)
+                if found.get('split'):
+                    _plan = '、'.join(f"{g['星期']}→{caregiver_label(g['居服員'])}" for g in found['split']['groups'])
+                    st.session_state['qual_method'] = 'now'
+                    return (f"示範：{client_label(client)} 一直由 {caregiver_label(found['worker'])} 服務（本期 {len(found['tasks'])} 次），"
+                            f"照專複評後新增{'失智' if found['need'] == 'dementia' else ' BA08 足部照護'}，原居服員沒有訓練。"
+                            f"有訓練的居服員裡沒有一位能接下全部 {len(found['tasks'])} 次（時段撞到其他案家或工時），"
+                            f"所以系統依星期分給 {found['options']} 位：{_plan}。下方已選「立即改派」，可以改選寬限期或交接比較。")
+                _story = ('照專複評後確認失智，但 {w} 沒有失智症照顧服務 20 小時訓練' if kind == 'dementia' else
+                          '照專複評後核定新增 BA08 足部照護（例如糖尿病足、趾甲增厚），但 {w} 沒有足部照護訓練')
                 return (f"示範：{client_label(client)} 一直由 {caregiver_label(found['worker'])} 服務（本期 {len(found['tasks'])} 筆），"
-                        f"重新評估後確認失智，但 {caregiver_label(found['worker'])} 沒有失智症照顧專長。下方已帶入案家與生效日，"
+                        + _story.format(w=caregiver_label(found['worker'])) + "。下方已帶入需求、案家與生效日，"
                         f"可以切換三種處理方式比較：寬限期（原居服員繼續、追蹤補訓）、交接過渡、立即改派。"
-                        f"有證照又能接下全部服務的有 {found['options']} 位，推薦 {caregiver_label(found['top'])}"
+                        f"有訓練又能接下全部服務的有 {found['options']} 位，推薦 {caregiver_label(found['top'])}"
                         f"（{_label_ids_plain(found['reason'])}）。")
             if kind in ('new1', 'new2'):
+                # 先只把整段 LINE 訊息放進輸入框並顯示原文，讓居督看到「收到什麼」；按「解析並定位」後才出現解析結果。
                 st.session_state["tc_raw"] = found['message']
-                _tc_parse()          # 與手動貼上 LINE 訊息後按「解析並定位」完全相同（門牌定位也一樣）
+                st.session_state["tc_demo_message"] = found['message']
+                st.session_state.pop("tc", None)
                 when = '、'.join(f"{pd.Timestamp(d):%m/%d}({'一二三四五六日'[pd.Timestamp(d).weekday()]}) {a}-{b}" for d, a, b in found['slots'])
                 tops = '；'.join(f"{pd.Timestamp(d):%m/%d} → {caregiver_label(t)}（{_label_ids_plain(r)}）"
                                 for (d, _, _), t, r in zip(found['slots'], found['top'], found['reason']) if t)
-                return (f"已載入 LINE 派案範例{found['example']}，日期改為 {when}（其他內容不變），並已解析、定位。"
-                        f"各時段可排人數：{'、'.join(str(n) for n in found['per_slot'])} 位。請到「③ 一次找出所有時段的人選」按「找人」，"
-                        f"會列出推薦名單、交通與理由。預計第一順位：{tops}。")
+                return (f"已載入 LINE 派案範例{found['example']}（日期改為 {when}，其他內容不變）。下方先顯示收到的整段 LINE 訊息；"
+                        f"請按「✨ 解析並定位」看系統讀出的資料，再到「③ 一次找出所有時段的人選」按「找人」。"
+                        f"各時段可排人數：{'、'.join(str(n) for n in found['per_slot'])} 位；預計第一順位：{tops}。")
             return ''
 
         if _demo_kind:
@@ -3387,7 +3414,10 @@ if "last_result" in st.session_state:
                         with st.spinner('從目前班表尋找可示範的日期與時段（會用同一套規則試算候選人，約數十秒）…'):
                             _dc, _ctx = _demo_context()
                             _finder = {'leave': _dc.find_leave, 'reschedule': _dc.find_reschedule, 'delay': _dc.find_delay,
-                                       'dementia': _dc.find_dementia, 'new1': lambda c: _dc.find_line_example(c, 1), 'new2': lambda c: _dc.find_line_example(c, 2)}[_kind]
+                                       'dementia': _dc.find_dementia,
+                                       'foot': lambda c: _dc.find_need_change(c, 'foot', prefer='DEMO0004'),
+                                       'needsplit': lambda c: (_dc.find_need_change(c, 'dementia', want_split=True, budget=40.0)
+                                                               or _dc.find_need_change(c, 'foot', want_split=True, budget=20.0)), 'new1': lambda c: _dc.find_line_example(c, 1), 'new2': lambda c: _dc.find_line_example(c, 2)}[_kind]
                             _found = _finder(_ctx)
                     except Exception as exc:
                         _found = None
@@ -4254,13 +4284,20 @@ if "last_result" in st.session_state:
 
             # ==========================================
 
-        elif _dynamic_event_type == "🧠 個案新增失智":
+        elif _dynamic_event_type == "🩺 個案照顧需求變更":
             import qualification_recheck as _qr
-            subhead('🧠 個案新增失智：重新檢核目前的居服員資格')
-            st.caption('案家重新評估後確認失智，原本服務的居服員沒有「失智症照顧專長」（20 小時訓練）時使用。'
-                       '系統會找出受影響的服務，並提供三種處理方式，不只有換人一條路。')
-            st.info('📌 法規提醒：失智症照顧服務 20 小時訓練，主要是失智型日照、團體家屋等失智專責服務的人員要求；'
-                    '一般居家服務去服務失智個案，是否必須受訓要看縣市契約、評鑑要求或單位內規，請依你們的規定選擇處理方式。')
+            subhead('🩺 個案照顧需求變更：重新檢核目前的居服員資格')
+            st.caption('照專複評後，案家新增「失智」或新增「BA08 足部照護」等需要特殊訓練的照顧需求，'
+                       '而原本服務的居服員沒有這項訓練時使用。系統會找出受影響的服務，並提供三種處理方式，不只有換人一條路。')
+            _q_need = st.radio('新增的需求', list(_qr.NEEDS), format_func=lambda k: _qr.NEEDS[k]['label'], key='qual_need', horizontal=True)
+            _q_info = _qr.NEEDS[_q_need]
+            if _q_need == 'dementia':
+                st.info('📌 法規提醒：失智症照顧服務 20 小時訓練，主要是失智型日照、團體家屋等失智專責服務的人員要求；'
+                        '一般居家服務去服務失智個案，是否必須受訓要看縣市契約、評鑑要求或單位內規，請依你們的規定選擇處理方式。')
+            else:
+                st.info('📌 BA08 足部照護須由完成足部照護訓練（10 小時）並登錄的居服員提供；實務上常見的是長期服務的案家，'
+                        '照專複評後才新增 BA08（例如糖尿病足、趾甲增厚），原居服員沒有這項訓練。'
+                        '也可以考慮原居服員繼續原本的服務、另排一位有訓練的人單獨做足部照護（需在週服務計畫另加一列）。')
             _q_tasks, _q_effective = _workflow_frames()
             _q_current = {str(t): (None if str(c) in _qr.EMPTY else str(c))
                           for t, c in zip(_q_effective.get('任務ID', []), _q_effective.get('派單居服員', []))}
@@ -4268,39 +4305,39 @@ if "last_result" in st.session_state:
                                  if any(_q_current.get(str(t)) for t in _q_tasks.loc[_q_tasks['案家ID'].astype(str) == c, '任務ID'])})
             _qc1, _qc2 = st.columns([2, 1])
             _q_client = _qc1.selectbox('案家', _q_clients, index=None, format_func=client_label, key='qual_client',
-                                       placeholder='選擇重新評估為失智的案家')
+                                       placeholder='選擇照專複評後新增需求的案家')
             _q_days = pd.to_datetime(_q_tasks['日期'], errors='coerce').dropna()
             if 'qual_since' not in st.session_state and len(_q_days):
                 st.session_state['qual_since'] = _q_days.min().date()
-            _q_since = _qc2.date_input('失智狀態生效日', key='qual_since')
+            _q_since = _qc2.date_input('新需求生效日', key='qual_since')
             if _q_client:
-                _q_aff = _qr.affected_tasks(_q_client, _q_tasks, _q_current, res['df_cg'], _q_since)
+                _q_aff = _qr.affected_tasks(_q_client, _q_tasks, _q_current, res['df_cg'], _q_since, need=_q_need)
                 if not _q_aff:
-                    st.success(f'✅ {client_label(_q_client)} 從 {_q_since} 起的服務，目前的居服員都有失智症照顧專長，不需要調整。')
+                    st.success(f'✅ {client_label(_q_client)} 從 {_q_since} 起的服務，目前的居服員都有{_q_info["course"]}，不需要調整。')
                 else:
                     _q_owner = _q_aff[0]['居服員']
                     _q_owners = sorted({a['居服員'] for a in _q_aff})
                     st.warning(f"⚠️ 重新檢核：{client_label(_q_client)} 有 {len(_q_aff)} 筆服務由 "
-                               f"{'、'.join(caregiver_label(o) for o in _q_owners)} 服務，但沒有失智症照顧專長。")
+                               f"{'、'.join(caregiver_label(o) for o in _q_owners)} 服務，但沒有{_q_info['course']}。")
                     show_table(pd.DataFrame([{'日期': a['日期'], '時段': f"{a['開始']}–{a['結束']}", '目前居服員': caregiver_label(a['居服員'])}
                                              for a in _q_aff]), hide_index=True, width='stretch')
-                    _q_key = (str(_q_client), str(_q_since), tuple(a['任務ID'] for a in _q_aff))
+                    _q_key = (_q_need, str(_q_client), str(_q_since), tuple(a['任務ID'] for a in _q_aff))
                     _q_cache = st.session_state.get('qual_avail')
                     if not _q_cache or _q_cache.get('key') != _q_key:
-                        with st.spinner('用同一套規則試算有證照的居服員能不能接（含前一案交通、工時、休息）…'):
+                        with st.spinner('用同一套規則試算有訓練的居服員能不能接（含前一案交通、工時、休息）…'):
                             _q_cfg = replace(config, client_primary_map=dict(config.client_primary_map),
                                              client_backup_map=dict(getattr(config, 'client_backup_map', None) or {}),
                                              task_support_map=dict(getattr(config, 'task_support_map', None) or {}),
                                              work_day_minutes=dict(config.work_day_minutes), dispatch_cache={})
-                            _q_avail = _qr.availability([a['任務ID'] for a in _q_aff], sorted(_qr.certified(res['df_cg'])),
+                            _q_avail = _qr.availability([a['任務ID'] for a in _q_aff], sorted(_qr.certified(res['df_cg'], _q_need)),
                                                         _q_tasks, _q_effective, res['df_cg'], _q_cfg, res.get('df_cl'), task_locations)
                         st.session_state['qual_avail'] = {'key': _q_key, 'avail': _q_avail}
                     _q_avail = st.session_state['qual_avail']['avail']
 
                     st.markdown('**選擇處理方式**')
-                    _q_method = st.radio('處理方式', list(_qr.METHODS), format_func=_qr.METHOD_LABEL.get, key='qual_method',
+                    _q_method = st.radio('處理方式', list(_qr.METHODS), format_func=lambda m: _qr.method_label(m, _q_need), key='qual_method',
                                          label_visibility='collapsed')
-                    st.caption('💡 ' + _qr.METHOD_HELP[_q_method])
+                    st.caption('💡 ' + _qr.method_help(_q_method, _q_need))
                     _q_deadline, _q_n = None, _qr.HANDOVER_VISITS
                     if _q_method == 'grace':
                         _q_deadline = st.date_input('補訓期限（預設生效日後 60 天）', value=_qr.default_deadline(_q_since),
@@ -4312,25 +4349,42 @@ if "last_result" in st.session_state:
                     _q_cover = _qr.covering(_q_avail, _q_parts['move'], _q_parts['accompany'])
                     _q_need_new = bool(_q_parts['move'] or _q_parts['accompany'])
                     _q_new = None
+                    _q_assign, _q_split = {}, None
                     if _q_need_new:
                         if not _q_cover:
-                            st.error('找不到一位有證照、又能接下（或陪同）全部這些服務的居服員。可以改選「寬限期」、縮短交接次數，'
-                                     '或到「未派案家」用整案處理分給兩位。')
+                            # 沒有一位能全包：依星期分給多位有訓練的人（同一個星期固定同一位）
+                            _q_dayof = {a['任務ID']: a['日期'] for a in _q_aff}
+                            _q_split = _qr.split_cover(_q_avail, _q_parts['move'], _q_parts['accompany'], _q_dayof)
+                            _q_assign = dict(_q_split['assign'])
+                            if not _q_assign:
+                                st.error('有訓練的居服員在這些時段都排不進。可以改選「寬限期」讓原居服員先補訓，'
+                                         '或到「未派案家」用整案處理調整時間。')
+                            else:
+                                _q_people = sorted(set(_q_assign.values()), key=lambda w: -list(_q_assign.values()).count(w))
+                                st.warning(f"沒有一位有訓練的居服員能接下全部 {len(_q_parts['move']) + len(_q_parts['accompany'])} 次服務，"
+                                           f"系統改成依星期分給 {len(_q_people)} 位（同一個星期固定同一位，長輩比較好適應）：")
+                                show_table(pd.DataFrame([{'星期': g['星期'], '接手居服員': caregiver_label(g['居服員']), '次數': g['筆數'],
+                                                          '挑選理由': _label_ids_plain(g['理由'])} for g in _q_split['groups']]),
+                                           hide_index=True, width='stretch')
+                                if _q_split['missing']:
+                                    st.error(f"還有 {len(_q_split['missing'])} 次找不到有訓練又排得進的人，套用後仍由原居服員服務，請另外處理（例如調整時間）。")
                         else:
                             _q_ids = [c['cg'] for c in _q_cover]
                             _q_why = {c['cg']: c['reason'] for c in _q_cover}
-                            _q_new = st.selectbox(f'接手的居服員（有失智症照顧專長，{len(_q_ids)} 位可選）', _q_ids, index=0,
+                            _q_new = st.selectbox(f'接手的居服員（有{_q_info["course"]}，{len(_q_ids)} 位可選）', _q_ids, index=0,
                                                   key=f'qual_new_{_q_client}_{_q_method}',
                                                   format_func=lambda v: ('⭐ 推薦｜' if v == _q_ids[0] else '') + caregiver_label(v)
                                                   + '　—　' + _label_ids_plain(_q_why.get(v, '')))
+                            _q_assign = {t: _q_new for t in [*_q_parts['move'], *_q_parts['accompany']]}
                     _q_label = {t: f"{a['日期']} {a['開始']}–{a['結束']}" for a in _q_aff for t in [a['任務ID']]}
                     _q_preview = []
                     for a in _q_aff:
                         t = a['任務ID']
+                        _who = _q_assign.get(t)
                         if t in _q_parts['move']:
-                            how = f"改由 {caregiver_label(_q_new)} 服務" if _q_new else '需要新居服員（尚未找到）'
+                            how = f"改由 {caregiver_label(_who)} 服務" if _who else '找不到人，暫由原居服員服務（需另外處理）'
                         elif t in _q_parts['accompany']:
-                            how = f"{caregiver_label(a['居服員'])} 服務，{caregiver_label(_q_new) if _q_new else '新居服員'} 陪同交接"
+                            how = f"{caregiver_label(a['居服員'])} 服務，{caregiver_label(_who) if _who else '（找不到陪同的人）'} 陪同交接"
                         else:
                             how = f"{caregiver_label(a['居服員'])} 繼續服務（待受訓，寬限期內）"
                         _q_preview.append({'服務': _q_label[t], '處理後': how})
@@ -4338,15 +4392,18 @@ if "last_result" in st.session_state:
                     show_table(pd.DataFrame(_q_preview), hide_index=True, width='stretch')
                     if _q_method == 'grace' and not _q_parts['move']:
                         st.caption('本次排班期間的服務都在寬限期內，班表不變；系統會把補訓期限記入追蹤清單（04 也看得到）。')
-                    if _q_parts['accompany'] and _q_new:
+                    if _q_parts['accompany'] and _q_assign:
                         st.caption('陪同交接不另計一筆服務，只檢查新居服員那個時段有空並記入追蹤清單；請另外通知兩位居服員。')
-                    _q_blocked = _q_need_new and not _q_new
+                    _q_blocked = _q_need_new and not _q_assign
                     if st.button('✅ 套用處理方式', type='primary', key='qual_apply', disabled=_q_blocked):
                         _q_now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
-                        _q_reason = compose_reason('資格證照不符', f'個案新增失智：{_qr.METHOD_SHORT[_q_method]}')
-                        if _q_new:
+                        _q_reason = compose_reason('資格證照不符', f'個案{_q_info["label"]}：{_qr.METHOD_SHORT[_q_method]}')
+                        _q_takers = sorted(set(_q_assign.values()), key=lambda w: (-list(_q_assign.values()).count(w), w))
+                        if _q_takers:
                             _prim, _backs = _qr.team_after(
-                                _q_method, _q_owner, list((config.client_backup_map or {}).get(str(_q_client)) or []), _q_new)
+                                _q_method, _q_owner, list((config.client_backup_map or {}).get(str(_q_client)) or []), _q_takers[0])
+                            if len(_q_takers) > 1:       # 分給多位：其他接手的人也加入固定人選團隊
+                                _backs = list(dict.fromkeys([*_q_takers[1:], *_backs]))[:max(2, len(_q_takers) - 1)]
                             config.client_primary_map = {**config.client_primary_map, str(_q_client): _prim}
                             config.client_backup_map = {**config.client_backup_map, str(_q_client): _backs}
                             for _store in (res, res.get('phase2') or {}):
@@ -4354,16 +4411,19 @@ if "last_result" in st.session_state:
                                 _store['client_backup_map'] = dict(config.client_backup_map)
                         _q_fail = []
                         for t in _q_parts['move']:
-                            _msg = _quick_reassign(t, _q_new, _q_reason, apply_scope='僅本次')
+                            if not _q_assign.get(t):
+                                _q_fail.append(f"{_q_label[t]}：找不到有訓練又排得進的人")
+                                continue
+                            _msg = _quick_reassign(t, _q_assign[t], _q_reason, apply_scope='僅本次')
                             if _msg:
                                 _q_fail.append(f"{_q_label[t]}：{_label_ids_plain(_msg)}")
                         st.session_state['dynamic_adjustment_log'].append({
-                            '時間戳記': _q_now, '事件類型': '個案新增失智', '案家ID': _q_client, '日期': str(_q_since),
-                            '處理方式': _qr.METHOD_SHORT[_q_method], '原居服員': _q_owner, '最終選擇居服員': _q_new or '',
+                            '時間戳記': _q_now, '事件類型': '個案' + _q_info['label'], '案家ID': _q_client, '日期': str(_q_since),
+                            '處理方式': _qr.METHOD_SHORT[_q_method], '原居服員': _q_owner, '最終選擇居服員': '、'.join(_q_takers),
                             '改派筆數': len(_q_parts['move']) - len(_q_fail), '陪同交接筆數': len(_q_parts['accompany']),
                             '原居服員續服務筆數': len(_q_parts['keep']), '原因': _q_reason})
                         _follow = _qr.followup(_q_method, client_label(_q_client), caregiver_label(_q_owner),
-                                               caregiver_label(_q_new) if _q_new else '', _q_parts, _q_deadline, _q_now)
+                                               '、'.join(caregiver_label(w) for w in _q_takers), _q_parts, _q_deadline, _q_now, need=_q_need)
                         st.session_state.setdefault('qualification_followups', []).append(_follow)
                         st.session_state['qual_notice'] = (
                             f"✅ {client_label(_q_client)} 已套用「{_qr.METHOD_SHORT[_q_method]}」：" + _follow['待辦'] + '。'
@@ -4732,9 +4792,9 @@ if "last_result" in st.session_state:
             _follow_rows = st.session_state.get('qualification_followups') or []
             if _follow_rows:
                 show_table(pd.DataFrame(_follow_rows), width='stretch', hide_index=True)
-                st.caption('寬限期到期前請確認原居服員已完成訓練並更新員工資料「取得資格」；未完成者請到「03 → 臨時異動 → 🧠 個案新增失智」改選交接或立即改派。')
+                st.caption('寬限期到期前請確認原居服員已完成訓練並更新員工資料「取得資格」；未完成者請到「03 → 臨時異動 → 🩺 個案照顧需求變更」改選交接或立即改派。')
             else:
-                st.info('目前沒有資格追蹤項目（案家新增失智等資格重新檢核會記在這裡）。')
+                st.info('目前沒有資格追蹤項目（案家新增失智、足部照護等資格重新檢核會記在這裡）。')
         module_nav_buttons(M_REVIEW)
 
     # 自動存檔：作業內容有變動（排班、改派、插單、整案調整、改期…）就寫入本機資料庫。

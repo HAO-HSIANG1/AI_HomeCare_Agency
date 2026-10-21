@@ -224,6 +224,18 @@ button[kind="segmented_controlActive"] p, [data-testid="stBaseButton-segmented_c
 .cf-guide-card.cf-guide-ok { background:linear-gradient(100deg,var(--cf-ok-soft),#fff 70%); border-left-color:var(--cf-ok); }
 .cf-guide-title { font-size:17px; font-weight:700; color:var(--cf-ink); margin-bottom:4px; }
 .cf-guide-body { font-size:14.5px; color:#4f6661; line-height:1.75; }
+/* LINE 派案訊息原文（示範） */
+.cf-line { background:#8cabd9; background:linear-gradient(180deg,#9bb6dd,#8aa9d6); border-radius:16px; padding:14px 16px 18px; margin:6px 0 10px; }
+.cf-line-head { color:#fff; font-size:13px; font-weight:700; letter-spacing:.04em; margin-bottom:10px; opacity:.95; }
+.cf-line-bubble { position:relative; display:inline-block; max-width:min(560px,100%); background:#fff; color:#1f2b2a; border-radius:18px; padding:12px 16px;
+  font-size:15px; line-height:1.75; white-space:pre-wrap; box-shadow:0 2px 6px rgba(0,0,0,.12); margin-left:10px; }
+.cf-line-bubble:before { content:""; position:absolute; left:-7px; top:12px; border-width:7px 10px 7px 0; border-style:solid; border-color:transparent #fff transparent transparent; }
+/* 主畫面單選選項與欄位標題放大（v19.6）：只針對單選與輸入欄標題，不動指標數字、按鈕與一般文字 */
+[data-testid="stMain"] [role="radiogroup"] label [data-testid="stMarkdownContainer"] p { font-size:17px !important; line-height:1.6; }
+[data-testid="stMain"] [role="radiogroup"] { gap:6px; }
+[data-testid="stMain"] [data-testid="stNumberInput"] [data-testid="stWidgetLabel"] p,
+[data-testid="stMain"] [data-testid="stDateInput"] [data-testid="stWidgetLabel"] p,
+[data-testid="stMain"] [data-testid="stSelectbox"] [data-testid="stWidgetLabel"] p { font-size:16px !important; font-weight:600; }
 </style>
 """
 

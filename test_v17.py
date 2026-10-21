@@ -86,7 +86,7 @@ class CaseWorkbookTests(unittest.TestCase):
             self.assertEqual(cases, ['A1', 'DEMO0003', 'DEMO0004'])
             plan = {r[1].value: r for r in res['週服務計畫'].iter_rows(min_row=2)}
             self.assertEqual(plan['DEMO0003'][3].value, '12:30:00')
-            self.assertEqual(plan['DEMO0004'][11].value, 'BA08(1)')
+            self.assertEqual(plan['DEMO0004'][11].value, 'BA02(1) BA20(1)')   # 示範「新增足部照護需求」前的原本服務
 
 
 class StampTests(unittest.TestCase):

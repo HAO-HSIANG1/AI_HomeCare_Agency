@@ -424,43 +424,64 @@ def find_new_case(ctx, budget=30.0):
     return best
 
 
-# ---------------- ⑤ 個案新增失智（資格重新檢核） ----------------
+# ---------------- ⑤ 個案照顧需求變更（資格重新檢核） ----------------
 
-def find_dementia(ctx, budget=40.0):
-    """找一個「目前非失智、由同一位沒有失智症照顧專長的居服員服務」的案家，
-    且至少一位有證照的人能接下全部服務（最好兩位以上，才看得出推薦＋可改選）。"""
+def find_need_change(ctx, need='dementia', prefer=None, budget=40.0, want_split=False):
+    """找一個「由同一位沒有該訓練的居服員服務、且還沒有這項需求」的案家，
+    且至少一位有訓練的人能接下全部服務（最好兩位以上，才看得出推薦＋可改選）。
+    prefer：優先試的案家（例如示範用的 DEMO0004，足部照護）。
+    want_split=True：改找「沒有一位能全包、但依星期分給兩位以上就能全部排進」的案家（示範分給多位）。"""
     import qualification_recheck as qr
     from care_policy import dementia_status
     started, best = time.time(), None
-    ok_ids = qr.certified(ctx.caregivers)
+    ok_ids = qr.certified(ctx.caregivers, need)
     if not ok_ids:
         return None
-    clients = ctx.clients.drop_duplicates('案家ID').set_index(ctx.clients.drop_duplicates('案家ID')['案家ID'].astype(str))
-    groups = sorted(ctx.routes.groupby('案家ID'), key=lambda g: (abs(len(g[1]) - 4), g[0]))
+    first = ctx.clients.drop_duplicates('案家ID')
+    clients = first.set_index(first['案家ID'].astype(str))
+    groups = sorted(ctx.routes.groupby('案家ID'), key=lambda g: (g[0] != prefer, abs(len(g[1]) - 4), g[0]))
     current = dict(zip(ctx.assigned['任務ID'].astype(str), ctx.assigned['派單居服員'].astype(str)))
+    items = ctx.merged.drop_duplicates('任務ID').set_index('任務ID')
     for client, frame in groups:
         if time.time() - started > budget:
             break
-        if not 2 <= len(frame) <= 8 or client not in clients.index:
+        if not (2 <= len(frame) <= (16 if want_split else 8)) or client not in clients.index:
             continue
-        if dementia_status(clients.loc[client].to_dict()) is True:
+        if need == 'dementia' and dementia_status(clients.loc[client].to_dict()) is True:
+            continue
+        if need == 'foot' and any('BA08' in _text(items.at[t, '服務項目']) if '服務項目' in items else False
+                                  for t in frame['任務ID'] if t in items.index):
             continue
         workers = set(frame['派單居服員'].astype(str))
         if len(workers) != 1 or workers & ok_ids or next(iter(workers)) not in ctx.motor:
             continue
-        affected = qr.affected_tasks(client, ctx.tasks, current, ctx.caregivers)
+        affected = qr.affected_tasks(client, ctx.tasks, current, ctx.caregivers, need=need)
         if len(affected) != len(frame):
             continue
         ids = [a['任務ID'] for a in affected]
         avail = qr.availability(ids, sorted(ok_ids), ctx.tasks, ctx.assigned, ctx.caregivers, ctx.cfg(), ctx.clients)
         cover = qr.covering(avail, ids)
-        if not cover:
+        split = None
+        if want_split:
+            if cover:
+                continue
+            split = qr.split_cover(avail, ids, day_of={a['任務ID']: a['日期'] for a in affected})
+            people = set(split['assign'].values())
+            if split['missing'] or len(people) < 2:
+                continue
+            cover = [{'cg': w, 'reason': next(g['理由'] for g in split['groups'] if g['居服員'] == w)} for w in sorted(people)]
+        elif not cover:
             continue
-        score = (len(cover) >= 2, -abs(len(ids) - 4))
+        score = ((client == prefer, len(cover) == 2, -len(ids)) if want_split
+                 else (client == prefer, len(cover) >= 2, -abs(len(ids) - 4)))
         if best is None or score > best['score']:
-            best = {'kind': 'dementia', 'client': client, 'worker': next(iter(workers)), 'tasks': ids,
+            best = {'kind': need, 'need': need, 'client': client, 'worker': next(iter(workers)), 'tasks': ids,
                     'since': affected[0]['日期'], 'top': cover[0]['cg'], 'reason': cover[0]['reason'],
-                    'options': len(cover), 'score': score}
-        if score[0]:
+                    'options': len(cover), 'score': score, 'split': split}
+        if score[0] or (prefer is None and score[1] and (not want_split or len(ids) <= 13)):
             break
     return best
+
+
+def find_dementia(ctx, budget=40.0):
+    return find_need_change(ctx, 'dementia', budget=budget)

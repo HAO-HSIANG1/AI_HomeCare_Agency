@@ -933,9 +933,10 @@ def _osrm_endpoint(transport_mode='機車'):
     raise ValueError('OSRM 機車路網僅支援機車；公車／捷運請使用 Google Routes。本版不提供其他交通方式。')
 
 
-def _osrm_cache_key(lat1, lon1, lat2, lon2, mode):
-    """快取鍵：主機、路網、交通方式、地圖版本、起訖座標（換地圖或主機就是不同的鍵）。"""
-    host, profile = _osrm_endpoint(mode)
+def _osrm_cache_key(lat1, lon1, lat2, lon2, mode, endpoint=None):
+    """快取鍵：主機、路網、交通方式、地圖版本、起訖座標（換地圖或主機就是不同的鍵）。
+    endpoint=(主機, 路網)：背景執行緒由呼叫端先決定好傳入，不在執行緒裡讀畫面設定。"""
+    host, profile = endpoint or _osrm_endpoint(mode)
     return (host, profile, mode, os.getenv('CAREFLOW_OSRM_MAP_VERSION', 'unspecified'),
             _round_coord(lat1), _round_coord(lon1), _round_coord(lat2), _round_coord(lon2))
 
@@ -1498,10 +1499,10 @@ def get_google_travel_time(lat1, lon1, lat2, lon2, transport_mode,
 OSRM_PARALLEL_REQUESTS = 4     # 同時送出的路網查詢數（Render 免費主機也撐得住；本機路網更快）
 
 
-def _fetch_osrm_table_chunk(origins, destinations, travel_min_per_km, transport_mode='機車', full=False):
+def _fetch_osrm_table_chunk(origins, destinations, travel_min_per_km, transport_mode='機車', full=False, endpoint=None):
     """查一塊交通矩陣。full=True 時不限定起訖，一次拿回這些點彼此「雙向」的時間（同一次請求多拿一倍資料）。
     回傳 {快取鍵: 分鐘}，同時寫進記憶體快取。"""
-    host, profile = _osrm_endpoint(transport_mode)
+    host, profile = endpoint or _osrm_endpoint(transport_mode)
     coords = list(dict.fromkeys(origins + destinations)) if full else origins + destinations
     coord_str = ';'.join(f'{lon},{lat}' for lat,lon in coords)
     params = {'annotations':'duration'}
@@ -1526,7 +1527,7 @@ def _fetch_osrm_table_chunk(origins, destinations, travel_min_per_km, transport_
         for j,(lat2,lon2) in enumerate(cols):
             duration = durations[i][j]
             if duration is not None and np.isfinite(float(duration)) and float(duration) >= 0:
-                key = _osrm_cache_key(lat1,lon1,lat2,lon2,transport_mode)
+                key = _osrm_cache_key(lat1,lon1,lat2,lon2,transport_mode,(host, profile))
                 _OSRM_TRAVEL_TIME_CACHE[key] = fetched[key] = float(duration)/60
     return fetched
 
@@ -1565,17 +1566,31 @@ def prefetch_osrm_travel_times(origins, destinations, travel_min_per_km=3.0, tra
         missing = [pair for pair in missing if wanted[pair] not in _OSRM_TRAVEL_TIME_CACHE]
     if not missing:
         return
-    plan = _plan_table_requests(origins, destinations, missing, table_limit(_osrm_endpoint(transport_mode)[0]))
+    endpoint = _osrm_endpoint(transport_mode)      # 在這個連線先決定主機（本機 Docker／雲端 Render），背景執行緒照用
+    plan = _plan_table_requests(origins, destinations, missing, table_limit(endpoint[0]))
     fetched = {}
     if len(plan) == 1:
-        fetched.update(_fetch_osrm_table_chunk(plan[0][0], plan[0][1], travel_min_per_km, transport_mode, full=True))
+        fetched.update(_fetch_osrm_table_chunk(plan[0][0], plan[0][1], travel_min_per_km, transport_mode, full=True, endpoint=endpoint))
     else:
         import contextvars
+        import threading
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=OSRM_PARALLEL_REQUESTS, thread_name_prefix='careflow-osrm') as pool:
-            # 每個請求沿用這次連線的設定（路網主機選擇等）
+        try:   # 讓背景執行緒掛上這個連線（避免 missing ScriptRunContext 警告，也能讀到這位使用者的設定）
+            from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+            script_ctx = get_script_run_ctx()
+        except Exception:
+            add_script_run_ctx = script_ctx = None
+
+        def attach():
+            if script_ctx is not None:
+                try:
+                    add_script_run_ctx(threading.current_thread(), script_ctx)
+                except Exception:
+                    pass
+        with ThreadPoolExecutor(max_workers=OSRM_PARALLEL_REQUESTS, thread_name_prefix='careflow-osrm', initializer=attach) as pool:
+            # 每個請求沿用這次連線的設定（主機已在上面決定；ContextVar 設定也一併帶過去）
             jobs = [pool.submit(contextvars.copy_context().run, _fetch_osrm_table_chunk, left, right, travel_min_per_km,
-                                transport_mode, True) for left, right in plan]
+                                transport_mode, True, endpoint) for left, right in plan]
             error = None
             for job in jobs:
                 try:

@@ -1,11 +1,11 @@
-"""個案狀態變動的資格重新檢核（第一個情境：案家新增「失智」）。
+"""個案照顧需求變更的資格重新檢核：案家新增「失智」或新增「BA08 足部照護」。
 
-原本由 A 長期服務的案家，重新評估後確認失智；A 沒有「失智症照顧專長」（20 小時訓練）時，
-不只一條路，居督可選三種處理方式：
+原本由 A 長期服務的案家，照專複評後新增需求（確認失智，或核定 BA08 足部照護），
+A 沒有對應訓練（失智症 20 小時／足部照護 10 小時）時，不只一條路，居督可選三種處理方式：
   grace    寬限期（待受訓）：A 繼續服務到期限，期限後的服務改由 B；追蹤 A 補訓。
   handover 交接過渡：前幾次仍由 A 服務、B 陪同認識案家，之後改由 B 服務。
   now      立即改派：所有受影響服務改由 B。
-失智個案怕換人，所以預設推薦「寬限期」；單位或縣市規定必須立即符合時才選「立即改派」。
+長期服務的案家（尤其失智）怕換人，所以預設推薦「寬限期」；單位或縣市規定必須立即符合時才選「立即改派」。
 
 這裡只放純計算（可單獨測試）；畫面與寫入班表在 app.py。
 """
@@ -17,19 +17,36 @@ import pandas as pd
 import caregiver_engine as engine
 
 CERT = '失智症照顧專長'
+# 需求種類：(畫面名稱, 需要的資格, 補訓課程, 寬限期說明)
+NEEDS = {
+    'dementia': {'label': '新增失智', 'cert': '失智症照顧專長', 'course': '失智症照顧服務 20 小時訓練',
+                 'why': '失智長輩對熟悉的照顧者比較穩定，換生面孔容易拒絕服務或出現情緒行為。',
+                 'excel': '把機構 Excel「個案資料」的是否失智改為「是」'},
+    'foot': {'label': '新增足部照護（BA08）', 'cert': 'BA08足部照護', 'course': 'BA08 足部照護 10 小時訓練',
+             'why': '長期服務的居服員熟悉長輩與家屬，補訓後由同一人做足部照護最順。',
+             'excel': '在機構 Excel「週服務計畫」這個案家的服務項目加上 BA08'},
+}
 METHODS = ('grace', 'handover', 'now')
-METHOD_LABEL = {
-    'grace': '① 寬限期・待受訓（原居服員繼續服務，期限內完成 20 小時訓練）',
-    'handover': '② 交接過渡（前幾次由原居服員服務、新居服員陪同，之後改由新居服員）',
-    'now': '③ 立即改派（單位或縣市規定必須立即符合時）',
-}
 METHOD_SHORT = {'grace': '寬限期・待受訓', 'handover': '交接過渡', 'now': '立即改派'}
-METHOD_HELP = {
-    'grace': '失智長輩對熟悉的照顧者比較穩定，換生面孔容易拒絕服務或出現情緒行為。若單位允許，優先讓原居服員補訓。'
-             '期限後仍未取得資格的服務，會先排給新居服員。',
-    'handover': '原居服員已確定不補訓、或案家狀況需要更有經驗的人時使用。前幾次讓新居服員陪同熟悉長輩與家屬，降低換人衝擊。',
-    'now': '單位內規或縣市契約要求失智個案必須由受訓人員服務、且沒有寬限時使用。',
-}
+
+
+def method_label(method, need='dementia'):
+    course = NEEDS[need]['course']
+    return {'grace': f'① 寬限期・待受訓（原居服員繼續服務，期限內完成{course}）',
+            'handover': '② 交接過渡（前幾次由原居服員服務、新居服員陪同，之後改由新居服員）',
+            'now': '③ 立即改派（單位或縣市規定必須立即符合時）'}[method]
+
+
+def method_help(method, need='dementia'):
+    info = NEEDS[need]
+    return {'grace': info['why'] + '若單位允許，優先讓原居服員補訓。期限後仍未取得資格的服務，會先排給有訓練的居服員。',
+            'handover': '原居服員確定不補訓、或案家狀況需要更有經驗的人時使用。前幾次讓新居服員陪同熟悉長輩與家屬，降低換人衝擊。',
+            'now': '單位內規或縣市契約要求必須由受訓人員服務、且沒有寬限時使用。'}[method]
+
+
+# 舊版相容（只有失智時的文字）
+METHOD_LABEL = {m: method_label(m) for m in METHODS}
+METHOD_HELP = {m: method_help(m) for m in METHODS}
 GRACE_DAYS = 60
 HANDOVER_VISITS = 2
 EMPTY = ('', '未指派', 'None', 'nan', 'NaT')
@@ -51,14 +68,15 @@ def _day(value):
     return '' if pd.isna(stamp) else stamp.strftime('%Y-%m-%d')
 
 
-def certified(df_cg):
-    """有失智症照顧專長的居服員ID。"""
-    return {_text(r.get('居服員ID')) for r in df_cg.to_dict('records') if engine.caregiver_has_cert(r, CERT)}
+def certified(df_cg, need='dementia'):
+    """有這項需求所需訓練的居服員ID。"""
+    cert = NEEDS[need]['cert']
+    return {_text(r.get('居服員ID')) for r in df_cg.to_dict('records') if engine.caregiver_has_cert(r, cert)}
 
 
-def affected_tasks(client, tasks, current_map, df_cg, since=None):
-    """這個案家從 since 起、目前由「沒有失智症照顧專長」的人服務的服務，依日期排序。"""
-    ok = certified(df_cg)
+def affected_tasks(client, tasks, current_map, df_cg, since=None, need='dementia'):
+    """這個案家從 since 起、目前由「沒有這項訓練」的人服務的服務，依日期排序。"""
+    ok = certified(df_cg, need)
     since = _day(since) if since else ''
     rows = tasks.loc[tasks['案家ID'].astype(str) == str(client)]
     out = []
@@ -134,17 +152,61 @@ def default_deadline(since):
     return start + timedelta(days=GRACE_DAYS)
 
 
-def followup(method, client, owner, newcomer, parts, deadline=None, created=''):
+def followup(method, client, owner, newcomer, parts, deadline=None, created='', need='dementia'):
     """追蹤清單的一筆（04 與臨時異動頁顯示，自動存檔一起保存）。"""
+    info = NEEDS[need]
     if method == 'grace':
-        todo = f'{owner} 需在 {_day(deadline)} 前完成失智症照顧服務 20 小時訓練，完成後請更新員工資料「取得資格」'
+        todo = f'{owner} 需在 {_day(deadline)} 前完成{info["course"]}，完成後請更新員工資料「取得資格」'
     elif method == 'handover':
         todo = f'前 {len(parts["accompany"])} 次由 {newcomer} 陪同交接，之後由 {newcomer} 服務'
     else:
         todo = f'已全部改由 {newcomer} 服務'
-    return {'案家': client, '原居服員': owner, '接手居服員': newcomer, '處理方式': METHOD_SHORT[method],
+    return {'案家': client, '需求變更': info['label'], '原居服員': owner, '接手居服員': newcomer, '處理方式': METHOD_SHORT[method],
             '期限': _day(deadline) if method == 'grace' else '', '原居服員續服務': len(parts['keep']),
             '新居服員陪同': len(parts['accompany']), '改由新居服員': len(parts['move']),
-            '待辦': todo, '提醒': '請同步把機構 Excel「個案資料」的是否失智改為「是」' + (
+            '待辦': todo, '提醒': '請同步' + info['excel'] + (
                 '（寬限期內先不要改，否則重新排班時原居服員會被判定資格不符）' if method == 'grace' else ''),
             '建立時間': created, '狀態': '追蹤中'}
+
+
+def split_cover(avail, need_ids, accompany_ids=(), day_of=None):
+    """沒有一位能全包時，依「星期」分給多位有訓練的人（同一個星期固定同一位，案家比較好適應）。
+    先挑能包下最多個星期的人，剩下的星期再找下一位；某個星期找不到一位包下時，那個星期逐次找人。
+    回傳 {'assign': {任務ID: 居服員ID}, 'groups': [{'星期','居服員','筆數','理由'}], 'missing': [任務ID]}。"""
+    need = list(dict.fromkeys([*need_ids, *accompany_ids]))
+    day_of = day_of or {}
+    week = '一二三四五六日'
+
+    def weekday(tid):
+        stamp = pd.to_datetime(day_of.get(tid), errors='coerce')
+        return '未定' if pd.isna(stamp) else '週' + week[stamp.weekday()]
+    groups = {}
+    for tid in need:
+        groups.setdefault(weekday(tid), []).append(tid)
+    able = {g: {c['cg']: c for c in covering(avail, ids)} for g, ids in groups.items()}
+    assign, rows, left = {}, [], [g for g in groups if able[g]]
+    while left:
+        counts = {}
+        for g in left:
+            for cg, info in able[g].items():
+                counts.setdefault(cg, []).append(info['avg_rank'])
+        best = min(counts, key=lambda cg: (-len(counts[cg]), sum(counts[cg]) / len(counts[cg]), cg))
+        for g in [g for g in left if best in able[g]]:
+            for tid in groups[g]:
+                assign[tid] = best
+            rows.append({'星期': g, '居服員': best, '筆數': len(groups[g]), '理由': able[g][best]['reason']})
+            left.remove(g)
+    missing = []
+    for g, ids in groups.items():
+        if able[g]:
+            continue
+        for tid in ids:                 # 這個星期沒人能全包：逐次找
+            options = avail.get(tid, [])
+            if options:
+                assign[tid] = options[0][0]
+                rows.append({'星期': g + '（' + str(day_of.get(tid, ''))[:10] + '）', '居服員': options[0][0], '筆數': 1, '理由': options[0][1]})
+            else:
+                missing.append(tid)
+    order = {w: i for i, w in enumerate(['週' + d for d in week])}
+    rows.sort(key=lambda r: (order.get(r['星期'][:2], 9), r['星期']))
+    return {'assign': assign, 'groups': rows, 'missing': missing}

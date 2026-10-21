@@ -71,3 +71,24 @@ def test_single_case_packs_both_directions(tmp_path, monkeypatch):
     limit = engine.table_limit(engine._osrm_endpoint()[0])
     assert n == -(-189 // (limit - 1))
     engine._OSRM_TRAVEL_TIME_CACHE.clear()
+
+
+def test_parallel_requests_use_the_host_chosen_in_this_session(tmp_path, monkeypatch):
+    """背景執行緒讀不到畫面設定時，也要用這位使用者選的主機（例如本機 Docker），不能退回預設的雲端主機。"""
+    import osrm_client
+    monkeypatch.setenv('CAREFLOW_CACHE_DIR', str(tmp_path))
+    engine._OSRM_TRAVEL_TIME_CACHE.clear()
+    main = threading.main_thread()
+    monkeypatch.setattr(engine, 'osrm_endpoint',
+                        lambda: 'http://127.0.0.1:5001' if threading.current_thread() is main else 'https://default.example')
+    hosts, calls = [], []
+    _fake_server(monkeypatch, calls)
+    fake = engine.request_json
+    monkeypatch.setattr(engine, 'request_json', lambda host, path, params=None, **k: hosts.append(host) or fake(host, path, params, **k))
+    rnd = random.Random(5)
+    places = [(round(25 + rnd.random() / 10, 6), round(121.4 + rnd.random() / 10, 6)) for _ in range(80)]
+    engine.prefetch_osrm_travel_times(places, places)
+    assert len(hosts) > 1 and set(hosts) == {'http://127.0.0.1:5001'}
+    key = engine._osrm_cache_key(*places[0], *places[1], '機車')
+    assert key[0] == 'http://127.0.0.1:5001' and key in engine._OSRM_TRAVEL_TIME_CACHE
+    engine._OSRM_TRAVEL_TIME_CACHE.clear()
