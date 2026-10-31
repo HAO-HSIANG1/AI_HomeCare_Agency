@@ -246,8 +246,11 @@ class FlexibleDispatchTests(unittest.TestCase):
         workers=[self.worker('CG_A','週日',121.50,25.00),self.worker('CG_B','週六',121.60,25.10),self.worker('CG_C','週六',121.506,25.006)]
         plans=[self.plan('CL_A','星期一','09:00:00','10:00:00',60),self.plan('CL_A','星期日','09:00:00','10:00:00',60)]
         base={'內部案號':'CL_A','歷史首選':'CG_A','經度 (WGS84_Lon)':121.505,'緯度 (WGS84_Lat)':25.005}
+        # 代班順序看交通時間區段：這個測試讓交通依直線距離變化（每公里 3 分），而不是全部 5 分鐘。
+        self.route.stop()
+        self.route=patch.object(e,'get_osrm_travel_time',side_effect=lambda a,b,c,d,*x,**k:max(3.0,e._distance_m(a,b,c,d)/1000*3.0));self.route.start()
         plain,_=self.run_period(workers,[base],plans,enable_backup_caregiver=True)
-        self.assertEqual(plain['client_backup_map'],{'CL_A':('CG_C',)})     # 無名單：選最近的
+        self.assertEqual(plain['client_backup_map'],{'CL_A':('CG_C',)})     # 無名單：選交通最近的（順路區段）
         seeded,_=self.run_period(workers,[{**base,'歷史備援':'CG_B'}],plans,enable_backup_caregiver=True)
         self.assertEqual(seeded['client_backup_map'],{'CL_A':('CG_B',)})    # 有名單：先試名單上的人
     def test_default_results_unchanged_by_new_options(self):
@@ -479,7 +482,9 @@ class ScheduleTravelTests(unittest.TestCase):
 
 class OsrmMotorcycleTests(unittest.TestCase):
     def setUp(self):
-        self.environment=patch.dict(e.os.environ,{'CAREFLOW_OSRM_MOTORCYCLE_HOST':'http://motor.test:5001'})
+        import tempfile
+        self.cache_dir=tempfile.mkdtemp()   # 每個測試用自己的硬碟快取，不會讀到上一次測試寫的路段
+        self.environment=patch.dict(e.os.environ,{'CAREFLOW_OSRM_MOTORCYCLE_HOST':'http://motor.test:5001','CAREFLOW_CACHE_DIR':self.cache_dir})
         self.environment.start();e._OSRM_TRAVEL_TIME_CACHE.clear()
     def tearDown(self):self.environment.stop();e._OSRM_TRAVEL_TIME_CACHE.clear()
     def response(self,data):
@@ -505,12 +510,14 @@ class OsrmMotorcycleTests(unittest.TestCase):
             self.assertEqual(get.call_count,1)
         self.assertFalse(e._OSRM_TRAVEL_TIME_CACHE)
     def test_table_populates_motor_cache_only(self):
-        with patch.object(e,'_get_travel_provider',return_value='osrm'),patch.object(e.requests,'get',return_value=self.response({'code':'Ok','durations':[[180]]})) as get:
+        # 一次矩陣請求同時拿回去程與回程（2×2 矩陣），之後兩個方向都不必再查。
+        with patch.object(e,'_get_travel_provider',return_value='osrm'),patch.object(e.requests,'get',return_value=self.response({'code':'Ok','durations':[[0,180],[240,0]]})) as get:
             e.prefetch_osrm_travel_times([(25,121)],[(25.1,121.1)],transport_mode='機車')
             self.assertIn('/table/v1/motorcycle/',get.call_args.args[0])
             self.assertEqual(e.get_osrm_travel_time(25,121,25.1,121.1),3)
+            self.assertEqual(e.get_osrm_travel_time(25.1,121.1,25,121),4)
             self.assertEqual(get.call_count,1)
-            self.assertEqual(len(e._OSRM_TRAVEL_TIME_CACHE),1)
+            self.assertEqual(len([k for k in e._OSRM_TRAVEL_TIME_CACHE if k[-4:-2]!=k[-2:]]),2)
     def test_transit_is_not_car_routing(self):
         with self.assertRaisesRegex(ValueError,'公車'):
             e.get_osrm_travel_time(25,121,25.1,121.1,transport_mode='大眾運輸')

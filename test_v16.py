@@ -1,5 +1,5 @@
 """v16 tests: pattern token stability, split/shift helpers, edits store, change log."""
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 import unittest
 import pandas as pd
 from pending_clients import (pattern_token, split_points, default_split_minutes, split_items, split_task, edited_pattern_table,

@@ -1,4 +1,4 @@
-"""Offline Taiwan doorplate geocoder (CAREFLOW_BUILD = '2026.10.11-v18').
+"""Offline Taiwan doorplate geocoder (CAREFLOW_BUILD = '2026.10.18-v19').
 
 Nothing here talks to the network.  The only data source is the government open
 data file「新北市門牌位置數值資料.csv」, compiled once into a compact index
@@ -16,7 +16,7 @@ under that prefix, i.e. how far the true door can plausibly be from the returned
 """
 from __future__ import annotations
 
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 
 import gzip
 import hashlib

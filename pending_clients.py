@@ -1,5 +1,5 @@
 """One pending row per client and a read-only whole-client assignment preview."""
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 from dataclasses import replace
 import hashlib
 from datetime import datetime

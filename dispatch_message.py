@@ -4,7 +4,7 @@ Pure Python (no Streamlit), so it can be unit-tested.  Works whether the sender 
 line breaks or the text was flattened into one line.  Only the facts needed to find
 a caregiver are extracted; free-text 概況簡述 is never interpreted as a hard rule.
 """
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 
 import re
 import unicodedata

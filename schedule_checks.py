@@ -1,6 +1,6 @@
 """Shared service-hour and rest checks; durations come from occupied time slots."""
 
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 def workload_error(slots, cap_hours=8, occupied_minutes=0, continuous_limit=240, rest_minutes=30, transfers=None):
     slots=sorted(slots)
     durations=[(b-a).total_seconds()/60 for a,b in slots]
@@ -56,6 +56,17 @@ def incremental_travel(result, tasks, caregivers, config, cache, calculate, init
     cg_map=caregivers.set_index('居服員ID').to_dict('index')
     seed = initial_routes.set_index('任務ID') if initial_routes is not None and not initial_routes.empty else None
     seed_ids=set(seed.index) if seed is not None else set()
+    # 沿用排班時算好的交通：欄位、簽章與列位置先整理一次，之後每位居服員每天只取列，不再逐組篩整張表。
+    base_cols=set(base.columns)
+    if seed is not None:
+        seed_frame=seed.reset_index()
+        seed_fields=[c for c in seed_frame if c not in base_cols or c in ('預估車程(分)','交通估算來源') or c.startswith(('交通','路段','含緩衝','轉場','配對起點'))]
+        seed_frame=seed_frame[['任務ID']+[c for c in seed_fields if c!='任務ID']]
+        seed_pos={tid:i for i,tid in enumerate(seed_frame['任務ID'])}
+        seed_sig=dict(zip(seed.index,seed['交通資料簽章'])) if '交通資料簽章' in seed else None
+    task_rows={}
+    for i,tid in enumerate(tasks['任務ID'].tolist()):
+        task_rows.setdefault(tid,[]).append(i)
     workers=base['派單居服員'].astype(str).tolist()
     task_ids=base['任務ID'].tolist()
     groups={}
@@ -86,11 +97,8 @@ def incremental_travel(result, tasks, caregivers, config, cache, calculate, init
         if old and old[0]==signature:
             travel=old[1]
         else:
-            group=base.iloc[indices].copy()
-            subset=tasks[tasks['任務ID'].isin(ids)].copy()
             travel=None
             if seed is not None and set(ids).issubset(seed_ids):
-                seeded=seed.loc[ids].reset_index()
                 if expected_sig is None:
                     # Validate every seeded route in one pass instead of once per caregiver-day.
                     from schedule_output import describe_routes
@@ -99,13 +107,13 @@ def incremental_travel(result, tasks, caregivers, config, cache, calculate, init
                         expected_sig=whole['交通資料簽章'].to_dict()
                     except Exception:
                         expected_sig={}
-                valid=('交通資料簽章' in seeded and all(
-                    expected_sig.get(tid) is not None and expected_sig.get(tid)==sig
-                    for tid,sig in zip(seeded['任務ID'],seeded['交通資料簽章'])))
+                valid=(seed_sig is not None and all(
+                    expected_sig.get(tid) is not None and expected_sig.get(tid)==seed_sig.get(tid) for tid in ids))
                 if valid:
-                    fields=[c for c in seeded if c not in group or c in ('預估車程(分)','交通估算來源') or c.startswith(('交通','路段','含緩衝','轉場','配對起點'))]
-                    travel=seeded[['任務ID']+[c for c in fields if c!='任務ID']].copy()
+                    travel=seed_frame.iloc[[seed_pos[tid] for tid in ids]].reset_index(drop=True)
             if travel is None:
+                group=base.iloc[indices].copy()
+                subset=tasks.iloc[sorted(i for t in set(ids) for i in task_rows.get(t,()))].copy()
                 computed=calculate(group,subset,caregivers,config)
                 fields=[c for c in computed if c not in group or c in ('預估車程(分)','交通估算來源') or c.startswith(('交通','路段','含緩衝','轉場','配對起點'))]
                 travel=computed[['任務ID']+[c for c in fields if c!='任務ID']].copy()

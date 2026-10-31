@@ -4,80 +4,83 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-This is an AI dispatch/scheduling engine for home-care caregivers (長照居家照顧派單系統), built for an AI competition. The core logic reads caregiver, client, task, and historical-service data from an Excel workbook, matches caregivers to today's pending tasks under hard/soft constraints, solves the assignment as a mixed-integer program, and then reports a causal (DiD) comparison of AI vs. human dispatch outcomes.
+**CareFlow（長照居家照顧 AI 排班系統）** — a Streamlit workbench for a home-care agency's 居督 (care supervisors). It reads one agency Excel workbook (employees, clients, weekly service plan, service codes), builds a recurring monthly/yearly schedule (fixed primary caregiver + backups, CP-SAT joint selection), then supports day-to-day exception handling (caregiver leave, reschedule, delay, new LINE cases, care-need changes), review/export, and manager-level workforce/financial analysis.
 
-There is no git repository, package manifest, or test suite yet — this is an early-stage prototype.
+Current build: `CAREFLOW_BUILD = '2026.10.18-v19'`. The README (Traditional Chinese) is the authoritative feature/behavior spec; `VALIDATION.md` holds benchmark numbers. Judge feedback and the redefined problem list from the latest demo live in `評審問題重新定義.md`.
 
-## File layout
+The early single-day prototype (Phase 1 scoring → Phase 2 MIP → Phase 3 DiD over `AI_Caregiver_Allocation_Ultimate_Database.xlsx`) still exists in `caregiver_engine.py` / `ai_caregiver_pipeline.py` but is **not** the main product path anymore.
 
-- `caregiver_engine.py` — all core logic (data loading, `PipelineConfig` dataclass of tunable dispatch-policy parameters, Phase 1/2/3 functions). Both entry points below import from here; do not duplicate logic into either of them.
-- `ai_caregiver_pipeline.py` — thin CLI entry point. Runs the three phases once with default `PipelineConfig` values and prints results to stdout.
-- `app.py` — Streamlit web dashboard, button-triggered (not live-recompute). Sidebar exposes 5 curated policy sliders (`buffer_mins`, `travel_penalty_weight` — drives both `travel_penalty_weight` and `objective_travel_weight`, `urgent_priority_bonus`, a "continuity bonus" slider mapped to `preferred_caregiver_bonus`, a "skill bonus" slider mapped to both `cert_bonus_dementia` and `cert_bonus_other`); the rest of `PipelineConfig` stays at its dataclass defaults. Block ① lets users upload a replacement `.xlsx` (or fall back to `DEFAULT_EXCEL_PATH`) and edit `Caregiver_Profiles`/`Client_Profiles`/`Today_Pending_Tasks` directly via `st.data_editor` (row add/delete built in; a small "新增欄位" control adds columns) — edited data lives in `st.session_state` and is only reset when the upload/file identity changes, not on every rerun. Block ② runs Phases 1–3 against the edited data when "🚀 執行 AI 最佳化派單" is clicked, then shows KPIs (派單成功率, 平均轉場時間, 平均適配得分), a 4-panel `st.pyplot`/matplotlib+seaborn dashboard (score histogram, per-caregiver load, assigned/unassigned pie, Phase 3 DiD satisfaction bars), and a results table with a `assigned_results.csv` download. There is no Plotly map in this version.
+## Running
 
-## Running the pipeline
-
-CLI (prints to stdout, no visualization):
-```bash
-python ai_caregiver_pipeline.py
+```powershell
+python -m pip install -r requirements.txt
+python -m streamlit run app.py          # main app
+python -m pip install -r requirements-dev.txt
+python -m pytest -q                     # tests/ (pytest)
+python -m unittest test_agency_import.py  # root-level legacy regression tests (test_v14..v18 etc.)
 ```
 
-Web dashboard (interactive, adjustable parameters):
-```bash
-streamlit run app.py
-```
+Run from the repo root. Default workbook auto-load: `00_DB/居服機構資料_三工作表.xlsx` (users normally upload instead). Deployment: `Dockerfile`, `docker-compose.yml`, `deploy/Caddyfile`, Streamlit Cloud (`packages.txt`).
 
-Requires: `pandas`, `numpy`, `openpyxl` (for reading `.xlsx`), `ortools` (for the MIP solver), `requests` (for OSRM travel-time queries — see "Travel time model" below), and — for the web dashboard only — `streamlit`, `matplotlib`, and `seaborn`. Both entry points must be run from the repo root since data loads via the relative path `./00_DB/AI_Caregiver_Allocation_Ultimate_Database.xlsx` (used by `app.py` only as the fallback when no file is uploaded). Live scheduling runs need outbound internet access to `router.project-osrm.org`; without it, every travel-time lookup falls back to the flat-degree estimate (see below) and prints a warning per unique coordinate pair or batch.
+Data note: column/sheet names are Traditional Chinese; keep them as-is. Read Excel via pandas or the Read tool — piping workbook contents through the Bash terminal mangles encoding.
 
-There are no lint/test/build commands configured in this repo.
+## Version guard (important when editing)
 
-## Data source
+`build_info.py` lists `REQUIRED_MODULES`; at startup `app.py` refuses to run unless every listed module contains the exact line `CAREFLOW_BUILD = '<version>'`. When bumping the version, update it in `build_info.py` **and every module in `REQUIRED_MODULES`**. When adding a new core module that app.py depends on, add it to `REQUIRED_MODULES` and give it the stamp.
 
-All input data lives in `00_DB/AI_Caregiver_Allocation_Ultimate_Database.xlsx`, with four sheets that map directly onto DataFrames in the script:
+## Input workbook (`load_agency_workbook` in `caregiver_engine.py`)
 
-- **Caregiver_Profiles** (`df_cg`) — one row per 居服員 (caregiver): home lat/lon, certifications, daily hour caps, current fatigue (monthly cumulative hours), average satisfaction score, exclusion conditions (e.g. refuses walk-ups/pets/smoking environments), and up to two pre-existing time-blocked appointments for today.
-- **Client_Profiles** (`df_cl`) — one row per 案家 (client household): service location, required caregiver gender, care level (CMS), special care needs, environment tags, heavy-lift-assistance flag, and historical preferred caregiver ID.
-- **Today_Pending_Tasks** (`df_tasks`) — today's unassigned tasks: time window, duration, priority, and requested service type. Merged with `Client_Profiles` on 案家ID at load time to form `tasks`.
-- **Historical_Service_Logs** (`df_hist`) — 300 historical service records with a `歷史媒合機制(Treatment)` flag (1 = AI-matched, 0 = human-matched) used purely for the Phase 3 outcome comparison, not for scheduling.
+One `.xlsx`, sheets matched by alias (exactly one of each required):
+- **員工資料** (`員工資料_去識別化`, `Caregiver_Profiles`) — caregivers: qualifications text (`取得資格`), 到職日 (seniority bonus, max 10), workable weekdays/hours, gender, transport mode, 排班期外本月加班時數 …
+- **個案資料** (`個案資料_去識別化`, `Client_Profiles`) — clients: location, 歷史首選 (employee ID → primary caregiver, +60), 是否失智 (requires 失智症 20h training), gender requirement …
+- **週服務計畫** (`周服務計畫`, `Weekly_Service_Plan`) — recurring weekly slots with service codes (e.g. `BA02+BA20`, `BA08(1)`), minutes, effective/expiry dates, every-other-week cycles; optional 週序列居服員 written back by the app.
+- **Service_code** (optional) — 系統代碼 / 必要證照 master (BA08 needs 足部照護 training).
+- Plus two optional name-mapping sheets (display only, never enter scheduling).
 
-Column names are Traditional Chinese; keep them as-is when reading/writing this workbook (spot checks with the Bash tool over this data mangle the encoding — read Excel contents via Python/pandas or the Read tool instead of piping through the terminal).
+Legacy column names (`失智症個案(0/1)`, `歷史首選居服員ID`) are still accepted; new columns win. `source_fields.py` normalizes aliases.
 
-Other files in `00_DB/` (PDFs, other `.xlsx` files) are reference/source materials for the long-term-care service statistics this project is built around — not consumed by the script.
+## Architecture
 
-## Pipeline architecture (`caregiver_engine.py`)
+**Scheduling core**
+- `caregiver_engine.py` (~4.5k lines) — `PipelineConfig` dataclass (all policy defaults incl. wages: 時薪 210, 轉場 46/次, 12h/day, 46h/month overtime, SA10 350), data loading, eligibility helpers, travel-time model (OSRM motorcycle + Google Routes transit, caching), `rank_candidates_by_availability`, `run_monthly_batch_dispatch` (thin wrapper → `monthly_scheduler.run_fixed_period_dispatch`), plus the legacy Phase 1/2/3 functions.
+- `monthly_scheduler.py` — fixed-period dispatch: reserve historical owners, allocate new clients, leave substitution, extend to period end with per-date checks.
+- `team_scheduler.py` — joint recurring-team planning with **OR-Tools CP-SAT** (`cp_model`), then date-aware extension and repair. `recurring_schedule.py` — recurring-visit identities / representative days.
+- `primary_optimizer.py` (+ CLI `optimize_primary.py`, `generate_history.py`) — choose/write back 歷史首選.
+- `agency_rules.py` — institution rules shared by auto dispatch, manual changes and payroll (revenue `預估服務營收`, wages, overtime). `schedule_checks.py` — service-hour/rest checks. `eligibility.py` / `care_policy.py` — per-requirement eligibility explanation (cert, weekday, hours, gender, leave…).
+- `substitute_rank.py` — **single shared substitute ordering** for leave cover, backups, temporary support, all four temporary events and manual reassignment: hard exclusions first, then familiarity → travel band (≤10/≤20/>20 min) → lower monthly hours → seniority; near overtime cap goes last. Does not use satisfaction (no such data).
 
-Three sequential phases, each a standalone function that both `ai_caregiver_pipeline.py` and `app.py` call in order:
+**Travel**
+- `osrm_client.py` — OSRM motorcycle host (`CAREFLOW_OSRM_MOTORCYCLE_HOST`, default Render `careflow-osrm-motorcycle.onrender.com`; local Docker in `osrm_motorcycle/`), bounded timeouts, never substitutes another mode. `traffic_wake.py` wakes the sleeping Render host in background.
+- Google Routes for bus/MRT (`GOOGLE_MAPS_API_KEY` from env or `st.secrets`), queried by actual date/time.
+- `persistent_cache.py` — road-leg cache `output_results/cache/road_legs.sqlite3` (30 days, keyed by host + `CAREFLOW_OSRM_MAP_VERSION`).
+- `address_geocoder.py` / `build_geo_index.py` — offline New Taipei doorplate geocoder (`data/ntpc_*`).
 
-1. **Phase 1 — `run_phase1_matching`** (candidate generation): for every (task × caregiver) pair, apply hard filters, then score survivors starting from `config.base_score` (default 60):
-   - Hard filters (reject pair entirely): gender requirement, heavy-lift capability requirement, `EXCLUSION_MAP` environment conflicts (caregiver aversion vs. client environment tag), and daily-hour-cap overflow. These are not exposed as adjustable — they are eligibility rules, not dispatch policy.
-   - Soft scoring (`score`, floored at 0): +certification match (`cert_bonus_dementia` / `cert_bonus_other`), +`preferred_caregiver_bonus` for historical preferred caregiver, +satisfaction deviation from `satisfaction_baseline` weighted by `satisfaction_weight`, −travel-time penalty (weighted by `travel_penalty_weight`, capped at `travel_penalty_cap`) computed from `calc_travel_minutes` (real OSRM road-network minutes, falling back to the `calc_distance_km` flat-degree approximation on API failure — see "Travel time model" below), −fatigue penalty (`fatigue_weight`) based on **service-intensity-weighted** monthly cumulative hours vs. `fatigue_reference_hours` (see "Fatigue model" below).
-   - Output: `df_matches`, one row per surviving (task, caregiver) candidate pair.
+**Exception handling & workflow**
+- `dispatch_workflow.py` — local SQLite `output_results/dispatch_workflow.sqlite3`: tables `records`, `blocks` (leave / unavailable spans), `leave_events`, `pending`, `history` (JSON audit trail), `client_primary`, `workdays`; `render_leave` form (one caregiver × one day per submit).
+- `temp_case.py` + `dispatch_message.py` — parse LINE "請問貴單位有人力嗎？" requests and batch-search slots.
+- `leave_report.py` — pure pandas: per-leave revenue/payroll delta from before/after day-payroll snapshots (only leaver + substitutes), ledger table, same-day summary, leave-frequency / most-substituted-client patterns. Events live in `dispatch_workflow` table `leave_events` (one row per registration; `remove_block` marks fully revoked events 已撤銷). The before snapshot is taken in `render_leave`'s `on_register` callback; the after snapshot is frozen in app.py right after `payroll_tables` once the cover is confirmed (retaken while travel is still NaN).
+- `qualification_recheck.py` — client gains 失智/BA08 → grace period / handover / immediate reassign.
+- `pending_clients.py`, `pending_advice.py`, `analysis_bg.py` — unassigned clients (one row per client), whole-client preview, remedies (shift time → change day → change person → split).
+- `issue_center.py` — classify conflicts/anomalies (read-only). `demo_cases.py` — finds guaranteed-solvable demo scenarios for the four temporary events.
+- `session_store.py` — autosave/restore of the whole work session. `runtime_views.py` — versioned snapshots so filters don't recompute.
 
-2. **Phase 2 — `run_phase2_optimization`** (time-conflict filtering + OR-Tools MIP):
-   - Drops candidate pairs that conflict with a caregiver's pre-existing appointments today, accounting for travel time plus `config.buffer_mins` transition buffer (parking/stairs/access/handoff).
-   - Builds a binary assignment MIP with OR-Tools' `SCIP` backend: decision var `X[task_id, cg_id]`; constraint 1 — each task assigned to at most one caregiver; constraint 2 — no caregiver double-booked into two new tasks whose windows (plus travel+buffer) overlap.
-   - Objective: maximize `match_score − objective_travel_weight×travel_minutes + priority_bonus` (priority_bonus is `urgent_priority_bonus` if the task priority string contains "緊急" (urgent), else `normal_priority_bonus`) — this weighting is where dispatch policy actually lives, not in the hard filters.
-   - Output: dict with `df_valid`, `df_result` (final task→caregiver assignment, includes lat/lon for map plotting), `status`, `assigned_count`.
+**Output & UI**
+- `app.py` (~4.9k lines) — Streamlit app, five modules via left nav: 01 資料匯入與排班設定 · 02 智慧排班作業 · 03 衝突與異常處理（含臨時異動：新增／請假／改期／延遲／照顧需求變更）· 04 排班結果與覆核 · 05 人力與效益分析.
+- `careflow_ui.py` (presentation helpers, no logic), `calendar_view.py`, `fast_calendar.py`, `dashboard_metrics.py` (pure pandas) + `dashboard_view.py`, `schedule_output.py` (pure views/export, never calls map APIs).
+- `schedule_assist.py`, `source_workbook.py`, `workbook_edit.py` — write reviewed owners/weekly clocks back into the original xlsx by editing XML, preserving formatting/formulas. `repair_workbook.py` — minimal workbook edits that raise dispatch success.
 
-3. **Phase 3 — `run_phase3_did`**: splits `Historical_Service_Logs` into AI-treated vs. human-control groups on `歷史媒合機制(Treatment)` and reports the uplift in mean satisfaction and reduction in early-termination rate attributable to AI matching. This is a retrospective analysis over historical data, independent of Phases 1–2's live scheduling run, and is **not** affected by `PipelineConfig` — it does not take config as an argument.
+## Conventions / invariants
 
-All dispatch-policy coefficients named above live in the `PipelineConfig` dataclass; `app.py`'s sidebar exposes one slider per field. When adding a new tunable coefficient, add it to `PipelineConfig` first, thread it through the relevant Phase function, then add a sidebar slider — never hardcode a new policy constant directly in `app.py` or `ai_caregiver_pipeline.py`.
+- Hard checks (never relaxed silently): required certs, gender requirement, workable weekdays/hours, leave, travel + rest, 12h/day, monthly overtime cap. Number of team members per client is a preference, not a hard cap.
+- Fixed-person rule: 1 primary + up to 2 backups; if none fit a single visit, other qualified caregivers may cover **that visit only** ("臨時支援"), never added to the backup team. Leave cover never overwrites the fixed team.
+- Confirmed/notified assignments are protected from automatic re-planning.
+- New dispatch-policy constants go into `PipelineConfig` (or the constant block at the top of `substitute_rank.py` for substitute thresholds) — never hardcode them in `app.py`.
+- Time strings use `"HH:MM-HH:MM"`; service minutes come from the source slot (only float noise < 1e-6 min tolerated).
+- The dashboard now uses native Streamlit components (`dashboard_view.py`), not matplotlib. `setup_chinese_font()` in `app.py` (bundled font in `assets/fonts/`) is currently unused; if matplotlib/seaborn charts are reintroduced, call it *after* any `sns.set_style(...)`, since seaborn resets `font.sans-serif` and drops CJK glyphs.
+- UI copy is plain-language Traditional Chinese for supervisors; keep reasons human-readable (e.g. 「服務過 12 次・前一案過來 6 分（順路）」).
 
-### Travel time model (OSRM)
+## Repo hygiene notes
 
-- `calc_travel_minutes(lat1, lon1, lat2, lon2, config)` is the single entry point for transition travel time, used identically in four places: Phase 1 scoring, Phase 2's existing-schedule conflict check, Phase 2's new-task-pair conflict check, and `_diagnose_caregiver_change`'s pair check — keep them consistent if changing the transit-time model.
-- Internally it calls `get_osrm_travel_time`, which queries the free OSRM public API (`router.project-osrm.org`, `biking` profile) for real road-network minutes between two points, backed by a module-level dict cache (`_OSRM_TRAVEL_TIME_CACHE`, keyed on coordinates rounded to 6 decimals). On request timeout (`OSRM_TIMEOUT_SECONDS`), network failure, or a non-`Ok` response, it prints an `[OSRM Warning]` log and falls back to the `calc_distance_km` flat-degree estimate (1° lat ≈ 111 km, 1° lon ≈ 101 km) × `travel_min_per_km`.
-- Before their pairwise loops, `run_phase1_matching` and `run_phase2_optimization` each call `prefetch_osrm_travel_times(origins, destinations, travel_min_per_km)`, which batches the whole origin×destination coordinate set into one (or a few, chunked at `OSRM_TABLE_MAX_COORDS`) OSRM `/table` matrix requests and pre-populates the shared cache — this is what keeps a 20-caregiver × 25-task run to a handful of HTTP calls instead of hundreds; without it the per-pair fallback path still works, just far slower. A failed batch prints a warning and leaves those pairs to be resolved (and independently degrade) on the next per-pair `get_osrm_travel_time` call.
-- `OSRM_HOST` / `OSRM_PROFILE` / timeouts are module-level constants, not `PipelineConfig` fields (same pattern as `calc_distance_km`'s constants) — they're plumbing, not dispatch policy.
-
-### Fatigue model (service-intensity-weighted)
-
-- `get_service_intensity_weight(task)` maps a task to a strain coefficient via `SERVICE_INTENSITY_WEIGHT`: 1.5 for heavy transfer/joint mobility (`需重度移位協助(0/1)==1`), 1.2 for meal care/tube feeding/hygiene (`特殊照護需求` in `{餐食照顧/管灌, 管路安全與特殊日常照護}`), else 0.8 (general housework/companionship, including dementia care).
-- Phase 1 no longer uses the flat `cg["當月累計服務時數(疲勞度)"] / fatigue_reference_hours` ratio; it now multiplies the caregiver's cumulative hours by the *current candidate task's* intensity weight first: `fatigue_penalty = (cg累計時數 × intensity_weight) / fatigue_reference_hours × fatigue_weight`. This is evaluated per (task, caregiver) pair (Phase 1 has no per-service-type history to sum over), so assigning a physically demanding task to an already-fatigued caregiver is penalized more than assigning a light one.
-
-### Other invariants when modifying this pipeline
-
-
-- `EXCLUSION_MAP` keys are caregiver `特殊排斥條件` values; values are the matching `案家環境特徵` string they conflict with. Both sides are exact-string-matched against the Excel data, so any new exclusion category must be added to both the map and used consistently in the source spreadsheet.
-- Time strings in the workbook use `"HH:MM-HH:MM"` (or the literal `"無既定行程"` sentinel for "no existing appointment"); `parse_time` and the task-time parsing in Phase 2 assume this exact format.
-- `app.py` only re-runs Phases 1–3 when the "🚀 執行 AI 最佳化派單" button is clicked (not on every slider/data-editor change); the last result is kept in `st.session_state["last_result"]` and re-displayed on subsequent reruns until the button is clicked again. Raw sheet reads are `st.cache_data`-cached (keyed on upload identity or file path + mtime), but the edited copies of `Caregiver_Profiles`/`Client_Profiles`/`Today_Pending_Tasks` live separately in `st.session_state` (`edit_cg`/`edit_cl`/`edit_tasks`) so user edits survive reruns and aren't clobbered by the cache.
-- `setup_chinese_font()` in `app.py` (sets `plt.rcParams["font.sans-serif"]`) must be called *after* `sns.set_style(...)`, not before — seaborn's `set_style` overwrites `font.sans-serif` back to its own default (Arial-first) list, which silently drops all CJK glyphs from the matplotlib dashboard.
+- `fix_*.py` at the root are one-off string-patch scripts for users who only had an older `app.py`; their changes are already in the current `app.py`. Don't run them, and don't put new logic there.
+- `_backup_v15_20261011/`, `careflow-prev/`, `AI_HomeCare_Agency*/`, `*.zip` are old copies/snapshots — not part of the app; exclude them from searches.
+- `00_DB/` holds the sample workbook, screenshots and result-report decks; `表單/` holds reference forms.

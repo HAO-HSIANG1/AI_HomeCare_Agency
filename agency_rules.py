@@ -3,7 +3,7 @@
 Payroll is a planning estimate for ordinary working days, not a payroll settlement.
 Home commuting is excluded. Inter-client travel and the working buffer count as work.
 """
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 import json
 import math
 
@@ -51,7 +51,7 @@ def leave_overlap(task, caregiver):
         except ValueError:
             return ''
     for block in blocks if isinstance(blocks, list) else []:
-        if block.get('reason') == '請假' and overlap(task, block):
+        if str(block.get('reason', '')).startswith('請假') and overlap(task, block):
             return f"請假 {block['start']}～{block['end']}"
     return ''
 
@@ -72,6 +72,10 @@ def primary_guard(task, caregiver, config):
     # 固定人選都排不進時，系統為「這一次服務」指定的臨時支援，不擴大為整案備援。
     support = getattr(config, 'task_support_map', {}).get(clean(task.get('任務ID')))
     if support and clean(caregiver.get('居服員ID')) == clean(support):
+        return None
+    # 處長規則：以「1 主責＋最多 2 備援」為原則；固定人選都排不進這一次服務時，可以再選其他合格居服員。
+    # 呼叫端先確認固定人選都不行，才暫時把這筆服務放進 open_support_tasks（不擴大為整案備援）。
+    if clean(task.get('任務ID')) in {clean(t) for t in (getattr(config, 'open_support_tasks', None) or ())}:
         return None
     profile = config.primary_profiles.get(owner)
     if leave_overlap(task, profile):
@@ -115,6 +119,42 @@ def monthly_overtime_error(cg_id, day, working_minutes, config, caregiver=None):
     if total > config.max_monthly_overtime_hours + 1e-7:
         return f'每月加班工時超標：{month} 加入後 {total:.2f} 小時，上限 {config.max_monthly_overtime_hours:g} 小時。'
     return None
+
+
+def consecutive_run_before(workdays, day):
+    """回傳 day（'YYYY-MM-DD'）之前、不中斷的已上班天數。workdays 為該居服員已知上班日期字串集合
+    （跨月持久種子＋本次已排），day 當天本身不計入。"""
+    day = pd.to_datetime(day, errors='coerce')
+    if pd.isna(day):
+        return 0
+    cursor = day - pd.Timedelta(days=1)
+    streak = 0
+    while cursor.strftime('%Y-%m-%d') in workdays:
+        streak += 1
+        cursor -= pd.Timedelta(days=1)
+    return streak
+
+
+def consecutive_workdays_error(worker, day, config):
+    """連續上班天數規則：若排入 day 會讓居服員連續上班達 config.max_consecutive_work_days+1 天，
+    回傳說明文字；否則回傳 None。
+
+    呼叫端決定如何處理非 None 的回傳值：AI 批次排班（monthly_scheduler.check_visit）視為硬性
+    擋下，一律不指派；人工插單／人工改派只拿它顯示提醒，不阻擋操作——規則判斷邏輯只有這一處，
+    兩邊共用，訊息文案與門檻值不會跑掉。
+
+    config.worker_workdays：{居服員ID: {日期字串,...}}，由呼叫端維護並持續寫入（本函式不修改）。
+    """
+    limit = int(getattr(config, 'max_consecutive_work_days', 6))
+    workdays = getattr(config, 'worker_workdays', {}).get(str(worker), set())
+    streak = consecutive_run_before(workdays, day)
+    if streak < limit:
+        return None
+    day_ts = pd.to_datetime(day, errors='coerce')
+    first = (day_ts - pd.Timedelta(days=streak)).strftime('%Y-%m-%d')
+    last = (day_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    return (f'已連續上班 {streak} 天（{first}～{last}），若 {day_ts.strftime("%Y-%m-%d")} 再排班，'
+            f'將達連續 {streak + 1} 天，超過上限 {limit} 天，不得連續上班逾 {limit} 天。')
 
 
 def payroll_tables(tasks, assignments, caregivers, routes, config):

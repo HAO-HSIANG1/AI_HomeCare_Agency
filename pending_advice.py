@@ -4,7 +4,7 @@
 最前面的幾項還會整案重跑一次預覽，顯示「套用後整案還剩幾次排不進」。
 建議只是參考，居督按「套用」之後仍要再預覽、確認。
 """
-CAREFLOW_BUILD = '2026.10.11-v18'
+CAREFLOW_BUILD = '2026.10.18-v19'
 import copy
 import pandas as pd
 from pending_clients import _fmt, _hm, split_points, default_split_minutes, split_task, pending_week_label
